@@ -1970,11 +1970,7 @@ static uint32_t __fastcall Detour_Precache_Shader(void* thisPtr, void* /*edx*/, 
     reinterpret_cast<CreateFn>(0x00594720)(pDecl, pFunc, &handle, 0);
     reinterpret_cast<LockFn>(0x002AA950)(locker);
     if (handle != 0 && pDecl != nullptr) {
-        if (shaderId == -1) {
-            d3d9_bridge::RegisterVertexShaderDecl(handle, pDecl);
-        } else {
-            LogPrintf("[D3D9] Programmable VS skipped (shaderId=%d, handle=0x%08X)\n", shaderId, handle);
-        }
+        d3d9_bridge::RegisterVertexShaderDecl(handle, pDecl, shaderId);
     }
     return handle;
 }
