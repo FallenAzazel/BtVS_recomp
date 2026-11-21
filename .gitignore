@@ -1,0 +1,30 @@
+# Game disc & extracted assets (never commit copyrighted game files)
+*.iso
+*.xbe
+*.pak
+*.rpe
+*.wmv
+*.wma
+*.mtx
+*.xpr
+*.bin
+extracted/
+Vimm's Lair.txt
+
+# Generated decompilation artifacts (reproducible locally via tools/)
+decompile/
+
+# Runtime build output, unpacked cache, saves, dumped/HD textures & local settings
+recomp/build/
+recomp/cache/
+recomp/saves/
+recomp/dump_textures/
+recomp/hd_textures/
+recomp/settings.ini
+
+# Logs, Python bytecode & editor/IDE files
+*.log
+*.Log
+__pycache__/
+*.pyc
+.vscode/
