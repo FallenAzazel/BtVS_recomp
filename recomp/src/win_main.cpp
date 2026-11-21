@@ -52,6 +52,8 @@ static void LoadSettingsIni() {
     g_cfg.aspectMode          = GetPrivateProfileIntA("Graphics", "AspectMode",          defAspect, g_settingsIniPath.c_str());
     g_cfg.targetFps           = GetPrivateProfileIntA("Graphics", "TargetFPS",           60,        g_settingsIniPath.c_str());
     g_cfg.atmosphericFog      = GetPrivateProfileIntA("Graphics", "AtmosphericFog",      1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.softBloom           = GetPrivateProfileIntA("Graphics", "SoftBloom",           0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.fovOffsetDeg        = static_cast<int>(GetPrivateProfileIntA("Graphics", "FovOffset", 0,  g_settingsIniPath.c_str()));
     g_cfg.gammaPercent        = GetPrivateProfileIntA("Graphics", "Gamma",               100,       g_settingsIniPath.c_str());
     g_cfg.brightnessPercent   = GetPrivateProfileIntA("Graphics", "Brightness",          100,       g_settingsIniPath.c_str());
     g_cfg.contrastPercent     = GetPrivateProfileIntA("Graphics", "Contrast",            100,       g_settingsIniPath.c_str());
@@ -73,6 +75,7 @@ static void LoadSettingsIni() {
     if (g_cfg.targetFps != 0 && g_cfg.targetFps != 30 && g_cfg.targetFps != 60 && g_cfg.targetFps != 120 && g_cfg.targetFps != 165) g_cfg.targetFps = 60;
     if (g_cfg.masterVolume < 0 || g_cfg.masterVolume > 100) g_cfg.masterVolume = 100;
     if (g_cfg.deadzonePercent < 0 || g_cfg.deadzonePercent > 40) g_cfg.deadzonePercent = 15;
+    if (g_cfg.fovOffsetDeg < -15 || g_cfg.fovOffsetDeg > 25) g_cfg.fovOffsetDeg = 0;
     if (g_cfg.gammaPercent < 50 || g_cfg.gammaPercent > 200) g_cfg.gammaPercent = 100;
     if (g_cfg.brightnessPercent < 50 || g_cfg.brightnessPercent > 150) g_cfg.brightnessPercent = 100;
     if (g_cfg.contrastPercent < 50 || g_cfg.contrastPercent > 150) g_cfg.contrastPercent = 100;
@@ -92,6 +95,8 @@ static void SaveSettingsIni() {
     writeU("Graphics", "AspectMode",          static_cast<int>(g_cfg.aspectMode));
     writeU("Graphics", "TargetFPS",           static_cast<int>(g_cfg.targetFps));
     writeU("Graphics", "AtmosphericFog",      g_cfg.atmosphericFog ? 1 : 0);
+    writeU("Graphics", "SoftBloom",           g_cfg.softBloom ? 1 : 0);
+    writeU("Graphics", "FovOffset",           g_cfg.fovOffsetDeg);
     writeU("Graphics", "Gamma",               g_cfg.gammaPercent);
     writeU("Graphics", "Brightness",          g_cfg.brightnessPercent);
     writeU("Graphics", "Contrast",            g_cfg.contrastPercent);
@@ -114,7 +119,9 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     g_cfg = cfg;
     d3d9_bridge::RequestGraphicsSettings(g_cfg.resScale, g_cfg.msaa, g_cfg.aniso, g_cfg.aspectMode);
     d3d9_bridge::SetFogEnabled(g_cfg.atmosphericFog);
+    d3d9_bridge::SetBloomEnabled(g_cfg.softBloom);
     d3d9_bridge::SetColorCorrection(g_cfg.gammaPercent, g_cfg.brightnessPercent, g_cfg.contrastPercent);
+    xbe_loader::SetFovOffsetDeg(g_cfg.fovOffsetDeg);
     d3d9_bridge::SetHDTexturesEnabled(g_cfg.enableHDTextures);
     d3d9_bridge::SetTextureDumpEnabled(g_cfg.dumpTextures);
     xbe_loader::SetAutoResumeQuickSave(g_cfg.autoResumeQuickSave);

@@ -549,7 +549,7 @@ static bool BuildCostumePatchedPak(const char* srcPakWinPath, uint32_t costumeId
 
     std::string activePak = std::string(cosRoot) + "\\active_costume.pak";
     std::string activeTag = std::string(cosRoot) + "\\active_costume.tag";
-    std::string wantTag   = std::string(srcPakWinPath) + "|" + std::to_string(costumeId) + "|v2";
+    std::string wantTag   = std::string(srcPakWinPath) + "|" + std::to_string(costumeId) + "|v3";
 
     // Fast path: reuse already-built patched pak if same level & costume
     std::vector<uint8_t> existingTag;
@@ -575,6 +575,45 @@ static bool BuildCostumePatchedPak(const char* srcPakWinPath, uint32_t costumeId
     dst.reserve(src.size() + 65536u);
     dst.insert(dst.end(), src.data(), src.data() + firstEntry);
 
+    // Helper: case-insensitive in-place same-length byte replacement (avoids texture-cache collisions
+    // in multi-costume paks like res_m00_spanishmission_3.pak which has both buffyslayer & buffyworkout!)
+    auto replaceAllSameLenI = [](uint8_t* buf, size_t len, const char* fromStr, const char* toStr) {
+        size_t sl = std::strlen(fromStr);
+        if (sl == 0 || sl != std::strlen(toStr) || len < sl) return;
+        for (size_t i = 0; i + sl <= len; ++i) {
+            if (_strnicmp(reinterpret_cast<const char*>(buf + i), fromStr, sl) == 0) {
+                std::memcpy(buf + i, toStr, sl);
+                i += sl - 1;
+            }
+        }
+    };
+
+    // Check if this pak contains multiple Buffy meshes (e.g. res_m00_spanishmission_3.pak)
+    int buffyMeshCount = 0;
+    {
+        size_t scan = firstEntry;
+        while (scan + 24u <= src.size()) {
+            uint32_t typ, fo, tot, pay, flg, nlen;
+            std::memcpy(&typ,  src.data() + scan + 0,  4);
+            std::memcpy(&fo,   src.data() + scan + 4,  4);
+            std::memcpy(&tot,  src.data() + scan + 8,  4);
+            std::memcpy(&pay,  src.data() + scan + 12, 4);
+            std::memcpy(&flg,  src.data() + scan + 16, 4);
+            std::memcpy(&nlen, src.data() + scan + 20, 4);
+            if (typ != 1u || fo != static_cast<uint32_t>(scan) || tot == 0 || scan + tot > src.size()) break;
+            if (24u + nlen + 8u <= tot) {
+                std::string name(reinterpret_cast<const char*>(src.data() + scan + 24u), nlen);
+                if (StrStartsWithI(name, "meshes\\chars\\slayer\\buffy") && StrEndsWithI(name, ".msh")) {
+                    ++buffyMeshCount;
+                }
+            }
+            scan += tot;
+        }
+    }
+    const bool multiCostumePak = (buffyMeshCount > 1);
+    int swappedMshCount = 0;
+    int swappedMtxCount = 0;
+
     size_t cur = firstEntry;
     int replaced = 0;
     while (cur + 24u <= src.size()) {
@@ -596,25 +635,39 @@ static bool BuildCostumePatchedPak(const char* srcPakWinPath, uint32_t costumeId
             size_t hdrBytes = 24u + nlen + 4u + snlen + 4u;
             if (hdrBytes <= tot && StrStartsWithI(name, "meshes\\chars\\slayer\\buffy")) {
                 std::string sub(reinterpret_cast<const char*>(src.data() + cur + 24u + nlen + 4u), snlen);
-                if (StrEndsWithI(name, ".msh") && _stricmp(sub.c_str(), "base") == 0) {
+                if (StrEndsWithI(name, ".msh") && _stricmp(sub.c_str(), "base") == 0 && (!multiCostumePak || swappedMshCount == 0)) {
                     dst.insert(dst.end(), src.data() + cur, src.data() + cur + hdrBytes);
+                    size_t payStart = dst.size();
                     dst.insert(dst.end(), cd.mesh.begin(), cd.mesh.end());
+                    if (multiCostumePak) {
+                        if (costumeId == 1) replaceAllSameLenI(dst.data() + payStart, cd.mesh.size(), "BuffySlayer", "BuffyCstm01");
+                        else if (costumeId == 4) replaceAllSameLenI(dst.data() + payStart, cd.mesh.size(), "BuffySport", "BuffyCstm4");
+                    }
                     uint32_t newPay = static_cast<uint32_t>(cd.mesh.size());
                     uint32_t newTot = static_cast<uint32_t>(hdrBytes) + newPay;
                     std::memcpy(dst.data() + newOff + 4,  &newOff, 4);
                     std::memcpy(dst.data() + newOff + 8,  &newTot, 4);
                     std::memcpy(dst.data() + newOff + 12, &newPay, 4);
                     swapped = true;
+                    ++swappedMshCount;
                     ++replaced;
-                } else if (StrEndsWithI(name, ".mtx")) {
+                } else if (StrEndsWithI(name, ".mtx") && (!multiCostumePak || swappedMtxCount < 3)) {
                     const std::vector<uint8_t>* rep = nullptr;
                     if (StrEndsWithI(sub, "_face")) rep = &cd.faceEntry;
                     else if (StrEndsWithI(sub, "_body")) rep = &cd.bodyEntry;
                     else if (StrEndsWithI(sub, "_leg"))  rep = &cd.legEntry;
                     if (rep) {
                         dst.insert(dst.end(), rep->begin(), rep->end());
+                        if (multiCostumePak) {
+                            // Rename only the entry's path/subname prefix in the header so it doesn't collide
+                            // with the second Buffy mesh's textures later in the same .pak!
+                            size_t hdrScan = std::min<size_t>(rep->size(), 128u);
+                            if (costumeId == 1) replaceAllSameLenI(dst.data() + newOff + 24u, hdrScan - 24u, "buffyslayer", "buffycstm01");
+                            else if (costumeId == 4) replaceAllSameLenI(dst.data() + newOff + 24u, hdrScan - 24u, "buffysport", "buffycstm4");
+                        }
                         std::memcpy(dst.data() + newOff + 4, &newOff, 4);
                         swapped = true;
+                        ++swappedMtxCount;
                         ++replaced;
                     }
                 }
@@ -1539,6 +1592,7 @@ static void*    g_lastViewRenderObj = nullptr;
 static float    g_lastRequestedFovX = 0.0f;
 static uint32_t g_lastAppliedAspect = 0xFFFFFFFFu;
 static bool     g_fovRefreshPending = false;
+static int      g_fovOffsetDeg      = 0;
 
 // Mirrors TGO::Map_IsValid() (0x00093990): true during gameplay levels, false on Main Menu / frontend
 static bool IsInGameplayMap() {
@@ -1564,7 +1618,14 @@ static bool __fastcall Detour_View_SetFOV(void* thisPtr, void* /*edx*/, float fo
     float targetAspect = (asp == 2u) ? (3440.0f / 1440.0f) : ((asp == 1u) ? (16.0f / 9.0f) : (4.0f / 3.0f));
 
     // Preserve exact original 4:3 vertical FOV (true Hor+), widen horizontal FOV & frustum planes to match aspect
-    float halfFov43 = fovX * 0.5f;
+    bool inMap = IsInGameplayMap();
+    float effFovX = fovX;
+    if (inMap && g_fovOffsetDeg != 0) {
+        effFovX += static_cast<float>(g_fovOffsetDeg) * 0.0174532925f;
+        if (effFovX < 0.45f) effFovX = 0.45f;
+        if (effFovX > 2.25f) effFovX = 2.25f;
+    }
+    float halfFov43 = effFovX * 0.5f;
     float tanHalfY  = std::tan(halfFov43) * 0.75f;
     float halfFovY  = std::atan(tanHalfY);
     float halfFovX  = std::atan(tanHalfY * targetAspect);
@@ -2546,6 +2607,18 @@ uint32_t GetTargetFps() {
 
 uint32_t GetMeasuredFps() {
     return g_measuredFps;
+}
+
+void SetFovOffsetDeg(int offsetDeg) {
+    int clamped = std::max(-15, std::min(25, offsetDeg));
+    if (clamped != g_fovOffsetDeg) {
+        g_fovOffsetDeg = clamped;
+        g_fovRefreshPending = true;
+    }
+}
+
+int GetFovOffsetDeg() {
+    return g_fovOffsetDeg;
 }
 
 void SetRumbleEnabled(bool enabled) {

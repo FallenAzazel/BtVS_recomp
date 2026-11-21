@@ -76,6 +76,7 @@ static uint32_t          g_boundTexW[4] = {};
 static uint32_t          g_boundTexH[4] = {};
 static bool              g_boundTexLin[4] = {};
 static bool              g_boundTexPresent[4] = {};
+static IDirect3DBaseTexture9* g_boundTexPtr[4] = {};
 static bool              g_boundTexVol[4] = {};
 static uint64_t          g_boundTexHash[4] = {};
 static uint32_t          g_boundTexFmt[4] = {};
@@ -99,6 +100,7 @@ static D3DPRESENT_PARAMETERS g_presentParams{};
 static D3DVIEWPORT9      g_lastXboxVp{0, 0, 640, 480, 0.0f, 1.0f};
 static D3DMATRIX         g_lastProjMatrix{};
 static bool              g_hasLastProj = false;
+static D3DMATRIX         g_lastWorldMatrix = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
 static std::atomic<bool> g_resetPending{false};
 static std::atomic<uint32_t> g_reqScale{3};
 static std::atomic<uint32_t> g_reqMsaa{4};
@@ -750,14 +752,25 @@ bool Init(HWND hRenderWnd, uint32_t xboxWidth, uint32_t xboxHeight, uint32_t res
 }
 
 // ============================================================================
-// Live GPU Post-Process: CRT Gamma Lift, Brightness & Contrast (Windowed + Fullscreen)
+// Live GPU Post-Process: Soft Bloom + CRT Gamma Lift, Brightness & Contrast
+// (Works identically in Windowed, Borderless & Fullscreen modes!)
 // ============================================================================
+static std::atomic<bool>      g_bloomEnabled{false};
 static std::atomic<int>       g_gammaPercent{100};
 static std::atomic<int>       g_brightnessPercent{100};
 static std::atomic<int>       g_contrastPercent{100};
-static IDirect3DTexture9*     g_postTex = nullptr;
-static IDirect3DPixelShader9* g_postPS  = nullptr;
+static IDirect3DTexture9*     g_postTex   = nullptr;
+static IDirect3DTexture9*     g_bloomTexA = nullptr;
+static IDirect3DTexture9*     g_bloomTexB = nullptr;
+static uint32_t               g_bloomW    = 0;
+static uint32_t               g_bloomH    = 0;
+static IDirect3DPixelShader9* g_postPS        = nullptr;
+static IDirect3DPixelShader9* g_bloomBrightPS = nullptr;
+static IDirect3DPixelShader9* g_bloomBlurPS   = nullptr;
 static bool                   g_postTriedCompile = false;
+
+void SetBloomEnabled(bool enabled) { g_bloomEnabled.store(enabled); }
+bool IsBloomEnabled() { return g_bloomEnabled.load(); }
 
 void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPercent) {
     g_gammaPercent.store(std::max(50, std::min(200, gammaPercent)));
@@ -766,14 +779,19 @@ void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPer
 }
 
 static void ReleasePostResources(bool releaseShader) {
-    if (g_postTex) { g_postTex->Release(); g_postTex = nullptr; }
+    if (g_postTex)   { g_postTex->Release();   g_postTex   = nullptr; }
+    if (g_bloomTexA) { g_bloomTexA->Release(); g_bloomTexA = nullptr; }
+    if (g_bloomTexB) { g_bloomTexB->Release(); g_bloomTexB = nullptr; }
+    g_bloomW = g_bloomH = 0;
     if (releaseShader) {
-        if (g_postPS) { g_postPS->Release(); g_postPS = nullptr; }
+        if (g_postPS)        { g_postPS->Release();        g_postPS        = nullptr; }
+        if (g_bloomBrightPS) { g_bloomBrightPS->Release(); g_bloomBrightPS = nullptr; }
+        if (g_bloomBlurPS)   { g_bloomBlurPS->Release();   g_bloomBlurPS   = nullptr; }
         g_postTriedCompile = false;
     }
 }
 
-static bool EnsurePostResources() {
+static bool EnsurePostResources(bool needBloom) {
     if (!g_dev) return false;
     if (!g_postPS && !g_postTriedCompile) {
         g_postTriedCompile = true;
@@ -792,23 +810,49 @@ static bool EnsurePostResources() {
                 UINT, UINT, D3DBlobIface**, D3DBlobIface**);
             auto fnCompile = reinterpret_cast<D3DCompileFn>(GetProcAddress(hComp, "D3DCompile"));
             if (fnCompile) {
+                auto compilePS = [&](const char* src, const char* name, IDirect3DPixelShader9** outPS) {
+                    D3DBlobIface* code = nullptr;
+                    D3DBlobIface* err  = nullptr;
+                    if (SUCCEEDED(fnCompile(src, std::strlen(src), name,
+                                            nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &err)) && code) {
+                        g_dev->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), outPS);
+                        code->Release();
+                    }
+                    if (err) err->Release();
+                };
                 static const char* kPostHlsl =
                     "sampler2D s0 : register(s0);\n"
+                    "sampler2D s1 : register(s1);\n"
                     "float4 cParams : register(c0);\n"
                     "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
                     "    float3 rgb = tex2D(s0, uv).rgb;\n"
+                    "    if (cParams.w > 0.001f) {\n"
+                    "        rgb += tex2D(s1, uv).rgb * cParams.w;\n"
+                    "    }\n"
                     "    rgb = pow(max(rgb, 0.0001f), cParams.x);\n"
                     "    rgb = (rgb - 0.5f) * cParams.z + 0.5f + cParams.y;\n"
                     "    return float4(saturate(rgb), 1.0f);\n"
                     "}\n";
-                D3DBlobIface* code = nullptr;
-                D3DBlobIface* err  = nullptr;
-                if (SUCCEEDED(fnCompile(kPostHlsl, std::strlen(kPostHlsl), "buffy_post.hlsl",
-                                        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &err)) && code) {
-                    g_dev->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &g_postPS);
-                    code->Release();
-                }
-                if (err) err->Release();
+                static const char* kBrightHlsl =
+                    "sampler2D s0 : register(s0);\n"
+                    "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
+                    "    float3 c = tex2D(s0, uv).rgb;\n"
+                    "    float l = dot(c, float3(0.299f, 0.587f, 0.114f));\n"
+                    "    float w = saturate((l - 0.68f) / 0.32f);\n"
+                    "    return float4(c * (w * w), 1.0f);\n"
+                    "}\n";
+                static const char* kBlurHlsl =
+                    "sampler2D s0 : register(s0);\n"
+                    "float4 cStep : register(c0);\n"
+                    "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
+                    "    float3 acc = tex2D(s0, uv).rgb * 0.227027f;\n"
+                    "    acc += (tex2D(s0, uv + cStep.xy * 1.384615f).rgb + tex2D(s0, uv - cStep.xy * 1.384615f).rgb) * 0.316216f;\n"
+                    "    acc += (tex2D(s0, uv + cStep.xy * 3.230769f).rgb + tex2D(s0, uv - cStep.xy * 3.230769f).rgb) * 0.070270f;\n"
+                    "    return float4(acc, 1.0f);\n"
+                    "}\n";
+                compilePS(kPostHlsl,   "buffy_post.hlsl",   &g_postPS);
+                compilePS(kBrightHlsl, "buffy_bright.hlsl", &g_bloomBrightPS);
+                compilePS(kBlurHlsl,   "buffy_blur.hlsl",   &g_bloomBlurPS);
             }
         }
     }
@@ -816,15 +860,36 @@ static bool EnsurePostResources() {
     if (!g_postTex && g_outW > 0 && g_outH > 0) {
         g_dev->CreateTexture(g_outW, g_outH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &g_postTex, nullptr);
     }
+    if (needBloom && g_bloomBrightPS && g_bloomBlurPS && (!g_bloomTexA || !g_bloomTexB) && g_outW > 0 && g_outH > 0) {
+        g_bloomW = std::max<uint32_t>(64u, g_outW / 4u);
+        g_bloomH = std::max<uint32_t>(64u, g_outH / 4u);
+        if (!g_bloomTexA) g_dev->CreateTexture(g_bloomW, g_bloomH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &g_bloomTexA, nullptr);
+        if (!g_bloomTexB) g_dev->CreateTexture(g_bloomW, g_bloomH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &g_bloomTexB, nullptr);
+    }
     return g_postTex != nullptr;
 }
 
+static void DrawFullScreenPostQuad(uint32_t w, uint32_t h) {
+    struct PostVert { float x, y, z, rhw, u, v; };
+    float fw = static_cast<float>(w);
+    float fh = static_cast<float>(h);
+    PostVert quad[4] = {
+        { -0.5f,     -0.5f,     0.0f, 1.0f, 0.0f, 0.0f },
+        { fw - 0.5f, -0.5f,     0.0f, 1.0f, 1.0f, 0.0f },
+        { -0.5f,     fh - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f },
+        { fw - 0.5f, fh - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f }
+    };
+    g_dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PostVert));
+}
+
 static void ApplyColorCorrectionPostPass() {
+    bool bloomOn = g_bloomEnabled.load();
     int gam = g_gammaPercent.load();
     int bri = g_brightnessPercent.load();
     int con = g_contrastPercent.load();
-    if (gam == 100 && bri == 100 && con == 100) return;
-    if (!EnsurePostResources()) return;
+    if (!bloomOn && gam == 100 && bri == 100 && con == 100) return;
+    if (!EnsurePostResources(bloomOn)) return;
 
     IDirect3DSurface9* bb = nullptr;
     IDirect3DSurface9* dstSurf = nullptr;
@@ -834,16 +899,13 @@ static void ApplyColorCorrectionPostPass() {
         return;
     }
 
-    // Resolve MSAA backbuffer into g_postTex, then apply 1-quad Gamma / Brightness / Contrast pass
+    // Resolve MSAA backbuffer into g_postTex
     HRESULT hr = g_dev->StretchRect(bb, nullptr, dstSurf, nullptr, D3DTEXF_NONE);
     dstSurf->Release();
-    bb->Release();
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) { bb->Release(); return; }
 
     D3DVIEWPORT9 prevVp{};
     bool hadVp = SUCCEEDED(g_dev->GetViewport(&prevVp));
-    D3DVIEWPORT9 fullVp{0, 0, g_outW, g_outH, 0.0f, 1.0f};
-    g_dev->SetViewport(&fullVp);
 
     g_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     g_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
@@ -852,12 +914,62 @@ static void ApplyColorCorrectionPostPass() {
     g_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
     g_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
 
+    // Optional quarter-res Soft Bloom (bright-pass + separable 5-tap Gaussian H/V blur)
+    bool bloomReady = false;
+    if (bloomOn && g_bloomTexA && g_bloomTexB && g_bloomBrightPS && g_bloomBlurPS) {
+        IDirect3DSurface9* sA = nullptr;
+        IDirect3DSurface9* sB = nullptr;
+        if (SUCCEEDED(g_bloomTexA->GetSurfaceLevel(0, &sA)) && SUCCEEDED(g_bloomTexB->GetSurfaceLevel(0, &sB))) {
+            D3DVIEWPORT9 bVp{0, 0, g_bloomW, g_bloomH, 0.0f, 1.0f};
+            g_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            g_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            g_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+            g_dev->SetSamplerState(0, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+            g_dev->SetSamplerState(0, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+
+            // Pass 1: Bright extract -> g_bloomTexA
+            g_dev->SetRenderTarget(0, sA);
+            g_dev->SetViewport(&bVp);
+            g_dev->SetPixelShader(g_bloomBrightPS);
+            g_dev->SetTexture(0, g_postTex);
+            DrawFullScreenPostQuad(g_bloomW, g_bloomH);
+
+            // Pass 2: Horizontal Gaussian blur -> g_bloomTexB
+            float stepH[4] = { 1.0f / static_cast<float>(g_bloomW), 0.0f, 0.0f, 0.0f };
+            g_dev->SetRenderTarget(0, sB);
+            g_dev->SetViewport(&bVp);
+            g_dev->SetPixelShader(g_bloomBlurPS);
+            g_dev->SetPixelShaderConstantF(0, stepH, 1);
+            g_dev->SetTexture(0, g_bloomTexA);
+            DrawFullScreenPostQuad(g_bloomW, g_bloomH);
+
+            // Pass 3: Vertical Gaussian blur -> g_bloomTexA
+            float stepV[4] = { 0.0f, 1.0f / static_cast<float>(g_bloomH), 0.0f, 0.0f };
+            g_dev->SetRenderTarget(0, sA);
+            g_dev->SetViewport(&bVp);
+            g_dev->SetPixelShaderConstantF(0, stepV, 1);
+            g_dev->SetTexture(0, g_bloomTexB);
+            DrawFullScreenPostQuad(g_bloomW, g_bloomH);
+
+            // Restore backbuffer render target
+            g_dev->SetRenderTarget(0, bb);
+            bloomReady = true;
+        }
+        if (sA) sA->Release();
+        if (sB) sB->Release();
+    }
+    bb->Release();
+
+    // Final composite pass: Scene + Subtle Bloom + CRT Gamma / Brightness / Contrast
+    D3DVIEWPORT9 fullVp{0, 0, g_outW, g_outH, 0.0f, 1.0f};
+    g_dev->SetViewport(&fullVp);
+
     float gammaVal = std::max(0.5f, static_cast<float>(gam) / 100.0f);
     float params[4] = {
         1.0f / gammaVal,                                // c0.x = inverse gamma (>100% lifts dark shadows)
         static_cast<float>(bri - 100) * 0.005f,         // c0.y = brightness offset (-0.25 .. +0.25)
         static_cast<float>(con) / 100.0f,               // c0.z = contrast scale (0.50 .. 1.50)
-        0.0f
+        bloomReady ? 0.34f : 0.0f                       // c0.w = subtle soft bloom strength
     };
     g_dev->SetPixelShader(g_postPS);
     g_dev->SetPixelShaderConstantF(0, params, 1);
@@ -867,21 +979,19 @@ static void ApplyColorCorrectionPostPass() {
     g_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
     g_dev->SetSamplerState(0, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
     g_dev->SetSamplerState(0, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
-
-    struct PostVert { float x, y, z, rhw, u, v; };
-    float w = static_cast<float>(g_outW);
-    float h = static_cast<float>(g_outH);
-    PostVert quad[4] = {
-        { -0.5f,     -0.5f,     0.0f, 1.0f, 0.0f, 0.0f },
-        { w - 0.5f,  -0.5f,     0.0f, 1.0f, 1.0f, 0.0f },
-        { -0.5f,     h - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
-        { w - 0.5f,  h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f }
-    };
-    g_dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PostVert));
+    if (bloomReady) {
+        g_dev->SetTexture(1, g_bloomTexA);
+        g_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        g_dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        g_dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        g_dev->SetSamplerState(1, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+        g_dev->SetSamplerState(1, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+    }
+    DrawFullScreenPostQuad(g_outW, g_outH);
 
     g_dev->SetPixelShader(nullptr);
     g_dev->SetTexture(0, nullptr);
+    g_dev->SetTexture(1, nullptr);
     if (!g_customVS && g_fvf) g_dev->SetFVF(g_fvf);
     if (hadVp) g_dev->SetViewport(&prevVp);
 }
@@ -1342,7 +1452,10 @@ void Swap(uint32_t /*flags*/) {
 
     // Safe per-frame texture cache flush (for F8 dump / F9 HD reload / toggle)
     if (g_flushCacheNextFrame.exchange(false)) {
-        for (uint32_t s = 0; s < 4; ++s) g_dev->SetTexture(s, nullptr);
+        for (uint32_t s = 0; s < 4; ++s) {
+            g_dev->SetTexture(s, nullptr);
+            g_boundTexPtr[s] = nullptr;
+        }
         for (auto& kv : g_texCache) {
             if (kv.second.tex) kv.second.tex->Release();
         }
@@ -1395,12 +1508,10 @@ void SetViewport(const void* pXboxViewport) {
     if (src->Width > 0 && src->Height > 0) {
         g_lastXboxVp = *src;
         D3DVIEWPORT9 vp{};
-        // ONLY the tiny bottom-left 3D HUD weapon icon sub-viewport should use 1:1 g_rhwScaleX!
-        // All other sub-viewports are 3D portal/skybox clip bounds (View_SetClipBound) which MUST scale by g_scaleX
-        // so off-center perspective portals & background skyboxes align pixel-for-pixel in 16:9 and 21:9!
+        // All bottom-row 3D HUD weapon icon sub-viewports (active weapon + D-Pad weapon selector carousel)
+        // use the exact same centered 4:3 coordinate space (g_rhwScaleX + g_rhwOffX) as the 2D Weapon Ring & highlight!
         bool isWeaponIconVp = (g_curAspect != 0 &&
                                src->Y >= 320 &&
-                               src->X + src->Width <= 220 &&
                                src->Width <= 160 && src->Height <= 160);
         if (g_menuPillarbox && g_curAspect != 0) {
             // Frontend Main Menu: pillarbox 3D scene (Buffy, moon, selected-item glow particles) to centered 4:3
@@ -1410,7 +1521,7 @@ void SetViewport(const void* pXboxViewport) {
             vp.Width  = std::min<DWORD>(g_outW - vp.X, static_cast<DWORD>(src->Width * g_rhwScaleX));
             vp.Height = std::min<DWORD>(g_outH - vp.Y, static_cast<DWORD>(src->Height * g_scaleY));
         } else if (isWeaponIconVp) {
-            vp.X      = std::min<DWORD>(g_outW > 0 ? g_outW - 1 : 0, static_cast<DWORD>(src->X * g_rhwScaleX));
+            vp.X      = std::min<DWORD>(g_outW > 0 ? g_outW - 1 : 0, static_cast<DWORD>(src->X * g_rhwScaleX + g_rhwOffX));
             vp.Y      = std::min<DWORD>(g_outH > 0 ? g_outH - 1 : 0, static_cast<DWORD>(src->Y * g_scaleY));
             vp.Width  = std::min<DWORD>(g_outW - vp.X, static_cast<DWORD>(src->Width * g_rhwScaleX));
             vp.Height = std::min<DWORD>(g_outH - vp.Y, static_cast<DWORD>(src->Height * g_scaleY));
@@ -1443,6 +1554,9 @@ void SetTransform(uint32_t xboxState, const void* pMatrix) {
         default: return;
     }
     const D3DMATRIX* mat = reinterpret_cast<const D3DMATRIX*>(pMatrix);
+    if (xboxState == 6) {
+        g_lastWorldMatrix = *mat;
+    }
     if (xboxState == 1) {
         g_lastProjMatrix = *mat;
         g_hasLastProj = true;
@@ -1550,6 +1664,7 @@ void SetTexture(uint32_t stage, const void* pXboxTexture) {
     if (!g_dev || stage >= 4) return;
     if (!pXboxTexture) {
         g_dev->SetTexture(stage, nullptr);
+        g_boundTexPtr[stage]     = nullptr;
         g_boundTexPresent[stage] = false;
         g_boundTexLin[stage]     = false;
         g_boundTexVol[stage]     = false;
@@ -1558,6 +1673,7 @@ void SetTexture(uint32_t stage, const void* pXboxTexture) {
     const auto* xtex = reinterpret_cast<const XboxD3DBaseTexture*>(pXboxTexture);
     IDirect3DBaseTexture9* tex = GetOrUploadTexture(stage, xtex);
     g_dev->SetTexture(stage, tex);
+    g_boundTexPtr[stage] = tex;
     auto it = g_texCache.find(xtex);
     if (it != g_texCache.end() && tex) {
         g_boundTexPresent[stage] = true;
@@ -1722,28 +1838,67 @@ static void SyncXboxStates() {
     g_dev->SetRenderState(D3DRS_CULLMODE, cull);
 
     // Texture Stage States for stages 0..3
+    bool isWaterSurface = (!g_customVS && g_fvf == 0x242 && ts[12] == 4 && ts[32 + 12] == 4 && rs[64] == 0);
     for (uint32_t s = 0; s < 4; ++s) {
         const uint32_t* st = ts + s * 32;
         uint32_t colorOp = st[12];
         uint32_t alphaOp = st[16];
+        if (isWaterSurface && s == 2) continue; // Configured by HD Water pass on Stage 1
         // Disable stages above 0 if no texture is bound and stage uses D3DTA_TEXTURE
         if (s > 0 && !g_boundTexPresent[s] && (colorOp == 0 || colorOp == 1)) {
             g_dev->SetTextureStageState(s, D3DTSS_COLOROP, D3DTOP_DISABLE);
             g_dev->SetTextureStageState(s, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
             continue;
         }
-        // Water surface (fvf=0x242, zWrite=0, Stage 0=animated water, Stage 1=multi-sector reflection atlas):
-        // Slate's software water shader copies scrolling tiling UVs into TEXCOORD1, which tiles the 8x8 atlas as a checkerboard.
-        // Replace Stage 1's tiled reflection with a moody murky green-teal tint & ~43% translucency matching original Xbox!
-        if (s == 1 && !g_customVS && g_fvf == 0x242 && ts[12] == 4 && colorOp == 4 && rs[64] == 0) {
-            g_dev->SetRenderState(D3DRS_TEXTUREFACTOR, 0x6E4A5E56u);
+        // HD Water Polish (fvf=0x242, zWrite=0, Stage 0=animated water, Stage 1=broken 8x8 reflection atlas):
+        // Replace Stage 1's tiled atlas with a counter-scrolling dual-layer copy of Stage 0's own water texture
+        // for authentic interference wave ripples, plus a gentle breathing moonlight/murky teal tint on Stage 2!
+        if (s == 1 && isWaterSurface) {
+            float tSec = static_cast<float>(GetTickCount() & 0xFFFFFu) * 0.001f;
+            float shimmer = 0.92f + 0.08f * std::sin(tSec * 1.4f);
+            uint32_t r = static_cast<uint32_t>(0x3A * shimmer);
+            uint32_t g = static_cast<uint32_t>(0x50 * shimmer);
+            uint32_t b = static_cast<uint32_t>(0x4A * shimmer);
+            uint32_t waterTint = (0x72u << 24) | ((r & 0xFFu) << 16) | ((g & 0xFFu) << 8) | (b & 0xFFu);
+
+            g_dev->SetRenderState(D3DRS_TEXTUREFACTOR, waterTint);
             g_dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
             g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
-            g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_MODULATE);
-            g_dev->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
-            g_dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-            g_dev->SetTextureStageState(1, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-            g_dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+
+            if (g_boundTexPtr[0]) {
+                // Stage 1: counter-scrolling 1.35x ripple interference layer using Stage 0's water texture
+                g_dev->SetTexture(1, g_boundTexPtr[0]);
+                g_dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                g_dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                g_dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                g_dev->SetSamplerState(1, D3DSAMP_MINFILTER, (g_maxAniso > 1) ? D3DTEXF_ANISOTROPIC : D3DTEXF_LINEAR);
+                g_dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                D3DMATRIX wMat{};
+                wMat._11 = 1.35f; wMat._22 = 1.35f; wMat._33 = 1.0f; wMat._44 = 1.0f;
+                wMat._31 = std::fmod(tSec * 0.032f, 1.0f);
+                wMat._32 = std::fmod(-tSec * 0.024f, 1.0f);
+                g_dev->SetTransform(D3DTS_TEXTURE1, &wMat);
+                g_dev->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
+                g_dev->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+                g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_ADDSMOOTH);
+                g_dev->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+                g_dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+                g_dev->SetTextureStageState(1, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+                g_dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+
+                // Stage 2: murky green-teal atmospheric tint & specular shimmer
+                g_dev->SetTextureStageState(2, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+                g_dev->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+                g_dev->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+                g_dev->SetTextureStageState(2, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+                g_dev->SetTextureStageState(2, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+            } else {
+                g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+                g_dev->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+                g_dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+                g_dev->SetTextureStageState(1, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+                g_dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+            }
             continue;
         }
         g_dev->SetSamplerState(s, D3DSAMP_ADDRESSU,    MapXboxAddress(st[0]));
@@ -1913,10 +2068,9 @@ static const void* ScaleRhwVerticesIfNeeded(const void* pVertexData, uint32_t ve
         } else if (minX > 310.0f && maxX > 460.0f && maxY < 150.0f && quadW >= 20.0f) {
             // Top-right Enemy Health bar & right-aligned cutscene location/timestamp text -> anchor to right edge
             edgeOffX = g_rhwOffX * 2.0f;
-        } else if (minX < 80.0f && maxX < 145.0f && minY > 315.0f && quadW >= 30.0f && quadH >= 12.0f) {
-            // Bottom-left Weapon Ring & durability bar ONLY (minX < 80 excludes TIP banner left end-cap!)
-            edgeOffX = 0.0f;
         }
+        // Bottom HUD (Weapon Ring, expanding D-Pad weapon selector carousel, highlight, TIP banners & subtitles)
+        // stays in the unified centered 4:3 safe zone so the D-Pad weapon highlight always aligns pixel-for-pixel!
     }
 
     for (uint32_t i = 0; i < vertexCount; ++i) {
@@ -2234,14 +2388,12 @@ void DrawIndexedVertices(uint32_t xboxPrimType, uint32_t vertexCount, const void
             // object's 3x4 World matrix into CD3DMatrixState::m_dRenderRegisters[6..8] (0x00834BC0)
             // instead of calling SetTransform(D3DTS_WORLD). Apply it cleanly for this draw!
             bool appliedConstWorld = false;
-            D3DMATRIX savedWorld{};
             if (d.shaderId >= 0) {
                 const float* c6 = reinterpret_cast<const float*>(0x00834BC0);
                 const float* c7 = reinterpret_cast<const float*>(0x00834BD0);
                 const float* c8 = reinterpret_cast<const float*>(0x00834BE0);
                 if (c6[0] != 0.0f || c6[1] != 0.0f || c6[2] != 0.0f ||
                     c7[0] != 0.0f || c7[1] != 0.0f || c7[2] != 0.0f) {
-                    g_dev->GetTransform(D3DTS_WORLD, &savedWorld);
                     D3DMATRIX w{};
                     w._11 = c6[0]; w._12 = c7[0]; w._13 = c8[0]; w._14 = 0.0f;
                     w._21 = c6[1]; w._22 = c7[1]; w._23 = c8[1]; w._24 = 0.0f;
@@ -2256,7 +2408,7 @@ void DrawIndexedVertices(uint32_t xboxPrimType, uint32_t vertexCount, const void
             g_dev->DrawIndexedPrimitiveUP(pt, 0, numVerts, primCount, idx, D3DFMT_INDEX16, g_customVsScratch.data(), outStride);
 
             if (appliedConstWorld) {
-                g_dev->SetTransform(D3DTS_WORLD, &savedWorld);
+                g_dev->SetTransform(D3DTS_WORLD, &g_lastWorldMatrix);
             }
         }
         return;
