@@ -1,4 +1,5 @@
 #include "d3d9_bridge.h"
+#include "xbe_loader.h"
 #include <d3d9.h>
 #include <algorithm>
 #include <atomic>
@@ -101,6 +102,25 @@ static D3DVIEWPORT9      g_lastXboxVp{0, 0, 640, 480, 0.0f, 1.0f};
 static D3DMATRIX         g_lastProjMatrix{};
 static bool              g_hasLastProj = false;
 static D3DMATRIX         g_lastWorldMatrix = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+static D3DMATRIX         g_lastViewMatrix  = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+static bool              g_hasLastView     = false;
+
+// Photo Mode / Free Camera state
+static std::atomic<bool> g_photoMode{false};
+static bool              g_photoCamInit   = false;
+static float             g_photoPos[3]    = { 0.0f, 0.0f, 0.0f };
+static float             g_photoYaw       = 0.0f;
+static float             g_photoPitch     = 0.0f;
+static std::atomic<int>  g_photoMouseDx{0};
+static std::atomic<int>  g_photoMouseDy{0};
+static LARGE_INTEGER     g_photoLastTick{};
+static D3DMATRIX         g_photoViewMatrix = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+static bool              g_skipWeaponIconDraw = false;
+
+// Screenshot capture state
+static std::atomic<bool> g_screenshotRequested{false};
+static std::string       g_screenshotDir;
+
 static std::atomic<bool> g_resetPending{false};
 static std::atomic<uint32_t> g_reqScale{3};
 static std::atomic<uint32_t> g_reqMsaa{4};
@@ -136,7 +156,125 @@ void RequestFrameTrace() {
     LogPrintf("[D3D9-TRACE] Next frame draw calls will be saved to recomp\\frame_trace.log\n");
 }
 
-static std::unordered_map<const void*, CachedTexture> g_texCache;
+void RequestScreenshot(const char* screenshotsDir) {
+    if (screenshotsDir && screenshotsDir[0]) {
+        g_screenshotDir = screenshotsDir;
+    }
+    g_screenshotRequested.store(true);
+}
+
+void SetPhotoMode(bool enabled) {
+    bool prev = g_photoMode.exchange(enabled);
+    if (prev != enabled) {
+        g_photoCamInit = false;
+        g_photoMouseDx.store(0);
+        g_photoMouseDy.store(0);
+        LogPrintf("[PhotoMode] %s\n", enabled ? "ENABLED (WASD+Q/E+Mouse/Arrows to fly, F12 to capture)" : "DISABLED");
+    }
+}
+
+bool IsPhotoMode() {
+    return g_photoMode.load();
+}
+
+void AddPhotoModeMouseDelta(int dx, int dy) {
+    if (!g_photoMode.load()) return;
+    g_photoMouseDx.fetch_add(dx);
+    g_photoMouseDy.fetch_add(dy);
+}
+
+static void UpdatePhotoModeCamera() {
+    if (!g_photoMode.load()) return;
+
+    LARGE_INTEGER now{}, freq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+
+    if (!g_photoCamInit) {
+        if (g_hasLastView) {
+            const D3DMATRIX& m = g_lastViewMatrix;
+            // D3D row-vector view matrix: cols 0,1,2 = Right, Up, Forward; row 3 = -dot(P, basis)
+            float rx = m._11, ry = m._21, rz = m._31;
+            float ux = m._12, uy = m._22, uz = m._32;
+            float fx = m._13, fy = m._23, fz = m._33;
+            float tx = m._41, ty = m._42, tz = m._43;
+            g_photoPos[0] = -(rx * tx + ux * ty + fx * tz);
+            g_photoPos[1] = -(ry * tx + uy * ty + fy * tz);
+            g_photoPos[2] = -(rz * tx + uz * ty + fz * tz);
+            float fLen = std::sqrt(fx * fx + fy * fy + fz * fz);
+            if (fLen > 1e-5f) {
+                fx /= fLen; fy /= fLen; fz /= fLen;
+            }
+            g_photoYaw   = std::atan2(fx, fz);
+            g_photoPitch = std::asin(std::max(-0.99f, std::min(0.99f, fy)));
+        }
+        g_photoLastTick = now;
+        g_photoMouseDx.store(0);
+        g_photoMouseDy.store(0);
+        g_photoCamInit = true;
+    }
+
+    float dt = 0.016f;
+    if (freq.QuadPart > 0 && now.QuadPart > g_photoLastTick.QuadPart) {
+        dt = static_cast<float>(now.QuadPart - g_photoLastTick.QuadPart) / static_cast<float>(freq.QuadPart);
+        if (dt > 0.1f) dt = 0.1f;
+    }
+    g_photoLastTick = now;
+
+    // Look via mouse delta + arrow keys
+    int mdx = g_photoMouseDx.exchange(0);
+    int mdy = g_photoMouseDy.exchange(0);
+    g_photoYaw   += static_cast<float>(mdx) * 0.0045f;
+    g_photoPitch -= static_cast<float>(mdy) * 0.0045f;
+
+    auto keyDown = [](int vk) -> bool { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    bool focused = true;
+    HWND fg = GetForegroundWindow();
+    if (fg && g_presentParams.hDeviceWindow) {
+        HWND root = GetAncestor(g_presentParams.hDeviceWindow, GA_ROOT);
+        focused = (fg == root || fg == g_presentParams.hDeviceWindow);
+    }
+    if (focused) {
+        const float keyRot = 1.8f * dt;
+        if (keyDown(VK_LEFT))  g_photoYaw   -= keyRot;
+        if (keyDown(VK_RIGHT)) g_photoYaw   += keyRot;
+        if (keyDown(VK_UP))    g_photoPitch += keyRot;
+        if (keyDown(VK_DOWN))  g_photoPitch -= keyRot;
+    }
+    if (g_photoPitch >  1.48f) g_photoPitch =  1.48f;
+    if (g_photoPitch < -1.48f) g_photoPitch = -1.48f;
+
+    float cp = std::cos(g_photoPitch), sp = std::sin(g_photoPitch);
+    float cy = std::cos(g_photoYaw),   sy = std::sin(g_photoYaw);
+    float fx = cp * sy, fy = sp, fz = cp * cy;
+    float rx = cy,      ry = 0.0f, rz = -sy;
+    float ux = -sp * sy, uy = cp, uz = -sp * cy;
+
+    if (focused) {
+        float speed = 8.0f;
+        if (keyDown(VK_SHIFT))   speed *= 3.5f;
+        if (keyDown(VK_CONTROL)) speed *= 0.25f;
+        float step = speed * dt;
+        if (keyDown('W')) { g_photoPos[0] += fx * step; g_photoPos[1] += fy * step; g_photoPos[2] += fz * step; }
+        if (keyDown('S')) { g_photoPos[0] -= fx * step; g_photoPos[1] -= fy * step; g_photoPos[2] -= fz * step; }
+        if (keyDown('D')) { g_photoPos[0] += rx * step; g_photoPos[2] += rz * step; }
+        if (keyDown('A')) { g_photoPos[0] -= rx * step; g_photoPos[2] -= rz * step; }
+        if (keyDown('E') || keyDown(VK_SPACE)) { g_photoPos[1] += step; }
+        if (keyDown('Q') || keyDown('C'))      { g_photoPos[1] -= step; }
+    }
+
+    D3DMATRIX& v = g_photoViewMatrix;
+    v._11 = rx; v._12 = ux; v._13 = fx; v._14 = 0.0f;
+    v._21 = ry; v._22 = uy; v._23 = fy; v._24 = 0.0f;
+    v._31 = rz; v._32 = uz; v._33 = fz; v._34 = 0.0f;
+    v._41 = -(g_photoPos[0] * rx + g_photoPos[1] * ry + g_photoPos[2] * rz);
+    v._42 = -(g_photoPos[0] * ux + g_photoPos[1] * uy + g_photoPos[2] * uz);
+    v._43 = -(g_photoPos[0] * fx + g_photoPos[1] * fy + g_photoPos[2] * fz);
+    v._44 = 1.0f;
+}
+
+static std::unordered_map<uint32_t, CachedTexture> g_texCache;
+static std::unordered_map<uint64_t, IDirect3DTexture9*> g_hdTexCache;
 static std::vector<uint8_t>  g_quadVertScratch;
 static std::vector<uint16_t> g_quadIdxScratch;
 static std::vector<uint8_t>  g_rhwVertScratch;
@@ -756,6 +894,9 @@ bool Init(HWND hRenderWnd, uint32_t xboxWidth, uint32_t xboxHeight, uint32_t res
 // (Works identically in Windowed, Borderless & Fullscreen modes!)
 // ============================================================================
 static std::atomic<bool>      g_bloomEnabled{false};
+static std::atomic<int>       g_sharpnessPercent{0};
+static std::atomic<bool>      g_vignetteEnabled{false};
+static std::atomic<bool>      g_scanlinesEnabled{false};
 static std::atomic<int>       g_gammaPercent{100};
 static std::atomic<int>       g_brightnessPercent{100};
 static std::atomic<int>       g_contrastPercent{100};
@@ -771,6 +912,11 @@ static bool                   g_postTriedCompile = false;
 
 void SetBloomEnabled(bool enabled) { g_bloomEnabled.store(enabled); }
 bool IsBloomEnabled() { return g_bloomEnabled.load(); }
+void SetSharpnessPercent(int sharpnessPercent) { g_sharpnessPercent.store(std::max(0, std::min(100, sharpnessPercent))); }
+void SetPostEffects(bool vignetteEnabled, bool scanlinesEnabled) {
+    g_vignetteEnabled.store(vignetteEnabled);
+    g_scanlinesEnabled.store(scanlinesEnabled);
+}
 
 void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPercent) {
     g_gammaPercent.store(std::max(50, std::min(200, gammaPercent)));
@@ -813,10 +959,19 @@ static bool EnsurePostResources(bool needBloom) {
                 auto compilePS = [&](const char* src, const char* name, IDirect3DPixelShader9** outPS) {
                     D3DBlobIface* code = nullptr;
                     D3DBlobIface* err  = nullptr;
-                    if (SUCCEEDED(fnCompile(src, std::strlen(src), name,
-                                            nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &err)) && code) {
+                    HRESULT hrC = fnCompile(src, std::strlen(src), name,
+                                            nullptr, nullptr, "main", "ps_3_0", 0, 0, &code, &err);
+                    if (FAILED(hrC) || !code) {
+                        if (err) { err->Release(); err = nullptr; }
+                        hrC = fnCompile(src, std::strlen(src), name,
+                                        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &err);
+                    }
+                    if (SUCCEEDED(hrC) && code) {
                         g_dev->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), outPS);
                         code->Release();
+                    } else if (err) {
+                        LogPrintf("[D3D9-ERROR] Shader '%s' compile failed: %s\n",
+                                  name, static_cast<const char*>(err->GetBufferPointer()));
                     }
                     if (err) err->Release();
                 };
@@ -824,13 +979,28 @@ static bool EnsurePostResources(bool needBloom) {
                     "sampler2D s0 : register(s0);\n"
                     "sampler2D s1 : register(s1);\n"
                     "float4 cParams : register(c0);\n"
+                    "float4 cSharp  : register(c1);\n"
+                    "float4 cFx     : register(c2);\n"
                     "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
-                    "    float3 rgb = tex2D(s0, uv).rgb;\n"
+                    "    float3 c = tex2D(s0, uv).rgb;\n"
+                    "    float3 n = tex2D(s0, uv + float2( 0.0f,    -cSharp.y)).rgb;\n"
+                    "    float3 s = tex2D(s0, uv + float2( 0.0f,     cSharp.y)).rgb;\n"
+                    "    float3 w = tex2D(s0, uv + float2(-cSharp.x, 0.0f)).rgb;\n"
+                    "    float3 e = tex2D(s0, uv + float2( cSharp.x, 0.0f)).rgb;\n"
+                    "    float3 mn = min(c, min(min(n, s), min(w, e)));\n"
+                    "    float3 mx = max(c, max(max(n, s), max(w, e)));\n"
+                    "    float3 amp = saturate(min(mn, 1.0f - mx) / max(mx, 0.001f));\n"
+                    "    float3 wt = -sqrt(amp) * (0.20f * cSharp.z);\n"
+                    "    float3 rgb = saturate(((n + s + w + e) * wt + c) / (1.0f + 4.0f * wt));\n"
                     "    if (cParams.w > 0.001f) {\n"
                     "        rgb += tex2D(s1, uv).rgb * cParams.w;\n"
                     "    }\n"
                     "    rgb = pow(max(rgb, 0.0001f), cParams.x);\n"
                     "    rgb = (rgb - 0.5f) * cParams.z + 0.5f + cParams.y;\n"
+                    "    float2 d = uv - 0.5f;\n"
+                    "    rgb *= saturate(1.0f - dot(d, d) * cFx.x * 2.4f);\n"
+                    "    float scanWave = abs(frac(uv.y * cFx.z) * 2.0f - 1.0f);\n"
+                    "    rgb *= (1.0f - cFx.y * scanWave);\n"
                     "    return float4(saturate(rgb), 1.0f);\n"
                     "}\n";
                 static const char* kBrightHlsl =
@@ -885,10 +1055,13 @@ static void DrawFullScreenPostQuad(uint32_t w, uint32_t h) {
 
 static void ApplyColorCorrectionPostPass() {
     bool bloomOn = g_bloomEnabled.load();
+    int sharp = g_sharpnessPercent.load();
+    bool vigOn = g_vignetteEnabled.load();
+    bool scanOn = g_scanlinesEnabled.load();
     int gam = g_gammaPercent.load();
     int bri = g_brightnessPercent.load();
     int con = g_contrastPercent.load();
-    if (!bloomOn && gam == 100 && bri == 100 && con == 100) return;
+    if (!bloomOn && sharp == 0 && !vigOn && !scanOn && gam == 100 && bri == 100 && con == 100) return;
     if (!EnsurePostResources(bloomOn)) return;
 
     IDirect3DSurface9* bb = nullptr;
@@ -971,8 +1144,22 @@ static void ApplyColorCorrectionPostPass() {
         static_cast<float>(con) / 100.0f,               // c0.z = contrast scale (0.50 .. 1.50)
         bloomReady ? 0.34f : 0.0f                       // c0.w = subtle soft bloom strength
     };
+    float sharpParams[4] = {
+        (g_outW > 0) ? (1.0f / static_cast<float>(g_outW)) : 0.0f,
+        (g_outH > 0) ? (1.0f / static_cast<float>(g_outH)) : 0.0f,
+        static_cast<float>(sharp) / 100.0f,
+        0.0f
+    };
+    float fxParams[4] = {
+        vigOn  ? 0.55f : 0.0f,
+        scanOn ? 0.34f : 0.0f,
+        480.0f, // 480 horizontal CRT scanlines
+        0.0f
+    };
     g_dev->SetPixelShader(g_postPS);
     g_dev->SetPixelShaderConstantF(0, params, 1);
+    g_dev->SetPixelShaderConstantF(1, sharpParams, 1);
+    g_dev->SetPixelShaderConstantF(2, fxParams, 1);
     g_dev->SetTexture(0, g_postTex);
     g_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     g_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
@@ -1002,6 +1189,10 @@ void Shutdown() {
         if (kv.second.tex) kv.second.tex->Release();
     }
     g_texCache.clear();
+    for (auto& kv : g_hdTexCache) {
+        if (kv.second) kv.second->Release();
+    }
+    g_hdTexCache.clear();
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
     if (g_d3d9) { g_d3d9->Release(); g_d3d9 = nullptr; }
     if (g_gdiplusToken) {
@@ -1075,7 +1266,7 @@ static IDirect3DBaseTexture9* GetOrUploadTexture(uint32_t stage, const XboxD3DBa
     if (!g_dev || !xtex || !xtex->Data) return nullptr;
 
     const uint32_t* curPal = (stage < 4) ? g_palettes[stage] : nullptr;
-    auto it = g_texCache.find(xtex);
+    auto it = g_texCache.find(xtex->Data);
     if (it != g_texCache.end() &&
         it->second.data == xtex->Data &&
         it->second.format == xtex->Format &&
@@ -1168,7 +1359,7 @@ static IDirect3DBaseTexture9* GetOrUploadTexture(uint32_t stage, const XboxD3DBa
                     vtex->UnlockBox(0);
                 }
                 CachedTexture ct{vtex, xtex->Data, xtex->Format, xtex->Size, width, height, false, curPal, 0, true};
-                g_texCache[xtex] = ct;
+                g_texCache[xtex->Data] = ct;
                 LogPrintf("[D3D9] Uploaded 3D Volume Texture (%ux%ux%u, fmt=0x%02X) for dynamic point/torch lighting!\n",
                           width, height, depth, fmtByte);
                 return vtex;
@@ -1264,6 +1455,13 @@ static IDirect3DBaseTexture9* GetOrUploadTexture(uint32_t stage, const XboxD3DBa
     if (wantHD || wantDump || g_tracingThisFrame) {
         texHash = HashXboxTexture(width, height, fmtByte, reinterpret_cast<const uint8_t*>(xtex->Data), lvl0Bytes);
         if (wantHD) {
+            auto hdCacheIt = g_hdTexCache.find(texHash);
+            if (hdCacheIt != g_hdTexCache.end() && hdCacheIt->second) {
+                hdCacheIt->second->AddRef();
+                CachedTexture ct{hdCacheIt->second, xtex->Data, xtex->Format, xtex->Size, width, height, (xtex->Size != 0) && !isDxt, curPal, texHash};
+                g_texCache[xtex->Data] = ct;
+                return hdCacheIt->second;
+            }
             auto hdIt = g_hdTextureFiles.find(texHash);
             if (hdIt != g_hdTextureFiles.end()) {
                 uint32_t rw = 0, rh = 0;
@@ -1273,8 +1471,10 @@ static IDirect3DBaseTexture9* GetOrUploadTexture(uint32_t stage, const XboxD3DBa
                     if (hdTex) {
                         LogPrintf("[HDTex] Replaced %016llx (%ux%u -> %ux%u HD)\n",
                                   static_cast<unsigned long long>(texHash), width, height, rw, rh);
-                        CachedTexture ct{hdTex, xtex->Data, xtex->Format, xtex->Size, width, height, (xtex->Size != 0) && !isDxt};
-                        g_texCache[xtex] = ct;
+                        hdTex->AddRef();
+                        g_hdTexCache[texHash] = hdTex;
+                        CachedTexture ct{hdTex, xtex->Data, xtex->Format, xtex->Size, width, height, (xtex->Size != 0) && !isDxt, curPal, texHash};
+                        g_texCache[xtex->Data] = ct;
                         return hdTex;
                     }
                 }
@@ -1382,7 +1582,7 @@ static IDirect3DBaseTexture9* GetOrUploadTexture(uint32_t stage, const XboxD3DBa
     }
 
     CachedTexture ct{tex, xtex->Data, xtex->Format, xtex->Size, width, height, (xtex->Size != 0) && !isDxt, curPal, texHash};
-    g_texCache[xtex] = ct;
+    g_texCache[xtex->Data] = ct;
     return tex;
 }
 
@@ -1422,6 +1622,84 @@ void Clear(uint32_t count, const void* pRects, uint32_t flags, uint32_t color, f
     g_dev->Clear(count, reinterpret_cast<const D3DRECT*>(pRects), d3d9Flags, color, z, stencil);
 }
 
+static void CaptureScreenshotIfRequested() {
+    if (!g_screenshotRequested.exchange(false) || !g_dev) return;
+
+    std::string dir = g_screenshotDir.empty() ? "screenshots" : g_screenshotDir;
+    CreateDirectoryA(dir.c_str(), nullptr);
+
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(g_dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) {
+        LogPrintf("[Screenshot] Failed to acquire backbuffer\n");
+        return;
+    }
+
+    D3DSURFACE_DESC desc{};
+    bb->GetDesc(&desc);
+
+    IDirect3DSurface9* srcSurf = bb;
+    IDirect3DSurface9* resolvedRt = nullptr;
+    if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
+        if (SUCCEEDED(g_dev->CreateRenderTarget(desc.Width, desc.Height, desc.Format,
+                                                D3DMULTISAMPLE_NONE, 0, FALSE, &resolvedRt, nullptr)) && resolvedRt) {
+            if (SUCCEEDED(g_dev->StretchRect(bb, nullptr, resolvedRt, nullptr, D3DTEXF_NONE))) {
+                srcSurf = resolvedRt;
+            }
+        }
+    }
+
+    IDirect3DSurface9* sysSurf = nullptr;
+    bool savedOk = false;
+    std::string outPath;
+    if (SUCCEEDED(g_dev->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                     D3DPOOL_SYSTEMMEM, &sysSurf, nullptr)) && sysSurf) {
+        if (SUCCEEDED(g_dev->GetRenderTargetData(srcSurf, sysSurf))) {
+            D3DLOCKED_RECT lr{};
+            if (SUCCEEDED(sysSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+                std::vector<uint32_t> argb(static_cast<size_t>(desc.Width) * desc.Height);
+                for (UINT y = 0; y < desc.Height; ++y) {
+                    const uint32_t* srcRow = reinterpret_cast<const uint32_t*>(
+                        static_cast<const uint8_t*>(lr.pBits) + y * lr.Pitch);
+                    uint32_t* dstRow = argb.data() + static_cast<size_t>(y) * desc.Width;
+                    for (UINT x = 0; x < desc.Width; ++x) {
+                        dstRow[x] = srcRow[x] | 0xFF000000u;
+                    }
+                }
+                sysSurf->UnlockRect();
+
+                if (EnsureGdiPlusInit() && g_hasPngClsid) {
+                    SYSTEMTIME st{};
+                    GetLocalTime(&st);
+                    char fname[128]{};
+                    std::snprintf(fname, sizeof(fname), "Buffy_%04u%02u%02u_%02u%02u%02u.png",
+                                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                    outPath = dir + "\\" + fname;
+                    if (GetFileAttributesA(outPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        std::snprintf(fname, sizeof(fname), "Buffy_%04u%02u%02u_%02u%02u%02u_%03u.png",
+                                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                        outPath = dir + "\\" + fname;
+                    }
+                    std::wstring wpath(outPath.begin(), outPath.end());
+                    Gdiplus::Bitmap bmp(static_cast<INT>(desc.Width), static_cast<INT>(desc.Height),
+                                        static_cast<INT>(desc.Width * 4), PixelFormat32bppARGB,
+                                        reinterpret_cast<BYTE*>(argb.data()));
+                    if (bmp.Save(wpath.c_str(), &g_pngClsid, nullptr) == Gdiplus::Ok) {
+                        savedOk = true;
+                        LogPrintf("[Screenshot] Saved %ux%u PNG to '%s'\n", desc.Width, desc.Height, outPath.c_str());
+                        xbe_loader::ShowStatusNotice("Screenshot saved!");
+                    }
+                }
+            }
+        }
+        sysSurf->Release();
+    }
+    if (resolvedRt) resolvedRt->Release();
+    bb->Release();
+    if (!savedOk) {
+        LogPrintf("[Screenshot] Failed to save screenshot\n");
+    }
+}
+
 void Swap(uint32_t /*flags*/) {
     if (!g_dev) return;
     if (g_tracingThisFrame) {
@@ -1438,7 +1716,11 @@ void Swap(uint32_t /*flags*/) {
         g_dev->EndScene();
         g_inScene = false;
     }
+    CaptureScreenshotIfRequested();
     g_dev->Present(nullptr, nullptr, nullptr, nullptr);
+    if (g_photoMode.load()) {
+        UpdatePhotoModeCamera();
+    }
     if (g_traceRequested.exchange(false)) {
         g_tracingThisFrame = true;
         g_traceDrawIdx = 0;
@@ -1460,6 +1742,10 @@ void Swap(uint32_t /*flags*/) {
             if (kv.second.tex) kv.second.tex->Release();
         }
         g_texCache.clear();
+        for (auto& kv : g_hdTexCache) {
+            if (kv.second) kv.second->Release();
+        }
+        g_hdTexCache.clear();
     }
 
     // Safe per-frame D3D9 Reset for live resolution / aspect / MSAA / Anisotropic changes
@@ -1510,9 +1796,9 @@ void SetViewport(const void* pXboxViewport) {
         D3DVIEWPORT9 vp{};
         // All bottom-row 3D HUD weapon icon sub-viewports (active weapon + D-Pad weapon selector carousel)
         // use the exact same centered 4:3 coordinate space (g_rhwScaleX + g_rhwOffX) as the 2D Weapon Ring & highlight!
-        bool isWeaponIconVp = (g_curAspect != 0 &&
-                               src->Y >= 320 &&
-                               src->Width <= 160 && src->Height <= 160);
+        bool isWeaponIconVp = (src->Y >= 320 && src->Width <= 160 && src->Height <= 160);
+        g_skipWeaponIconDraw = isWeaponIconVp;
+        bool isWideWeaponIconVp = (g_curAspect != 0 && isWeaponIconVp);
         if (g_menuPillarbox && g_curAspect != 0) {
             // Frontend Main Menu: pillarbox 3D scene (Buffy, moon, selected-item glow particles) to centered 4:3
             // so 3D menu glows align pixel-for-pixel behind the 2D menu text and no background leaks past the border.
@@ -1520,7 +1806,7 @@ void SetViewport(const void* pXboxViewport) {
             vp.Y      = std::min<DWORD>(g_outH > 0 ? g_outH - 1 : 0, static_cast<DWORD>(src->Y * g_scaleY));
             vp.Width  = std::min<DWORD>(g_outW - vp.X, static_cast<DWORD>(src->Width * g_rhwScaleX));
             vp.Height = std::min<DWORD>(g_outH - vp.Y, static_cast<DWORD>(src->Height * g_scaleY));
-        } else if (isWeaponIconVp) {
+        } else if (isWideWeaponIconVp) {
             vp.X      = std::min<DWORD>(g_outW > 0 ? g_outW - 1 : 0, static_cast<DWORD>(src->X * g_rhwScaleX + g_rhwOffX));
             vp.Y      = std::min<DWORD>(g_outH > 0 ? g_outH - 1 : 0, static_cast<DWORD>(src->Y * g_scaleY));
             vp.Width  = std::min<DWORD>(g_outW - vp.X, static_cast<DWORD>(src->Width * g_rhwScaleX));
@@ -1554,6 +1840,19 @@ void SetTransform(uint32_t xboxState, const void* pMatrix) {
         default: return;
     }
     const D3DMATRIX* mat = reinterpret_cast<const D3DMATRIX*>(pMatrix);
+    if (xboxState == 0) {
+        if (g_photoMode.load()) {
+            if (!g_photoCamInit) {
+                g_lastViewMatrix = *mat;
+                g_hasLastView = true;
+                UpdatePhotoModeCamera();
+            }
+            g_dev->SetTransform(D3DTS_VIEW, &g_photoViewMatrix);
+            return;
+        }
+        g_lastViewMatrix = *mat;
+        g_hasLastView = true;
+    }
     if (xboxState == 6) {
         g_lastWorldMatrix = *mat;
     }
@@ -1674,7 +1973,7 @@ void SetTexture(uint32_t stage, const void* pXboxTexture) {
     IDirect3DBaseTexture9* tex = GetOrUploadTexture(stage, xtex);
     g_dev->SetTexture(stage, tex);
     g_boundTexPtr[stage] = tex;
-    auto it = g_texCache.find(xtex);
+    auto it = g_texCache.find(xtex->Data);
     if (it != g_texCache.end() && tex) {
         g_boundTexPresent[stage] = true;
         g_boundTexW[stage]       = it->second.width;
@@ -2181,6 +2480,7 @@ static bool TryDrawScaledRhwLineList(uint32_t xboxPrimType, uint32_t vertexCount
 
 void DrawVerticesUP(uint32_t xboxPrimType, uint32_t vertexCount, const void* pVertexData, uint32_t stride) {
     if (!g_dev || !pVertexData || vertexCount == 0 || stride == 0 || g_customVS) return;
+    if (g_photoMode.load() && ((g_fvf & D3DFVF_XYZRHW) || g_skipWeaponIconDraw)) return;
     EnsureSceneBegun();
     SyncXboxStates();
     const void* vdata = ScaleRhwVerticesIfNeeded(pVertexData, vertexCount, stride);
@@ -2221,6 +2521,7 @@ void DrawVerticesUP(uint32_t xboxPrimType, uint32_t vertexCount, const void* pVe
 
 void DrawIndexedVerticesUP(uint32_t xboxPrimType, uint32_t vertexCount, const void* pIndexData, const void* pVertexData, uint32_t stride) {
     if (!g_dev || !pIndexData || !pVertexData || vertexCount == 0 || stride == 0 || g_customVS) return;
+    if (g_photoMode.load() && ((g_fvf & D3DFVF_XYZRHW) || g_skipWeaponIconDraw)) return;
     EnsureSceneBegun();
     SyncXboxStates();
 
@@ -2261,6 +2562,7 @@ void DrawIndexedVerticesUP(uint32_t xboxPrimType, uint32_t vertexCount, const vo
 
 void DrawIndexedVertices(uint32_t xboxPrimType, uint32_t vertexCount, const void* pIndexData) {
     if (!g_dev || !g_streams[0] || g_strides[0] == 0 || vertexCount == 0) return;
+    if (g_photoMode.load() && g_skipWeaponIconDraw) return;
     uintptr_t rawIdx = reinterpret_cast<uintptr_t>(pIndexData);
     const uint16_t* idx = nullptr;
     if (rawIdx >= 0x00010000u) {

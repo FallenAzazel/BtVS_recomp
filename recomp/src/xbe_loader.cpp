@@ -884,6 +884,108 @@ static bool     g_autoResumeQuick    = false;
 static volatile LONG g_quickSaveReq     = 0;
 static volatile LONG g_quickLoadReq     = 0;
 static volatile LONG g_costumeReloadReq = 0;
+static volatile LONG g_jumpLevelReq     = 0;
+static int           g_activeSaveSlot   = 1;
+static int           g_reqSaveSlot      = 1;
+static int           g_reqLoadSlot      = 1;
+static char          g_jumpMapName[128] = {};
+
+static bool          g_mouseLookEnabled = false;
+static bool          g_subtitlesEnabled = true;
+static bool          g_autoPauseUnfocused = false;
+static bool          g_cheatInfHealth     = false;
+static bool          g_cheatInfPower      = false;
+static bool          g_cheatInfAmmo       = false;
+static bool          g_cheatOneHitDust    = false;
+
+static void SyncSubtitlesFlagToEngine() {
+    uint32_t gamePtr = *reinterpret_cast<const uint32_t*>(0x007D0090);
+    if (gamePtr < 0x00010000u || IsBadReadPtr(reinterpret_cast<const void*>(gamePtr), 0x24)) return;
+    uint32_t optsPtr = *reinterpret_cast<const uint32_t*>(gamePtr + 0x20);
+    if (optsPtr < 0x00010000u || IsBadWritePtr(reinterpret_cast<void*>(optsPtr + 0x34), 0xB0)) return;
+    *reinterpret_cast<uint8_t*>(optsPtr + 0xE2) = g_subtitlesEnabled ? 1u : 0u;
+    // Built-in engine Infinite Slayer Power cheat bit (TGameOptions + 0x34 bit 0x02, read by ISlayer::Power_Change)
+    uint8_t* pCheatFlags = reinterpret_cast<uint8_t*>(optsPtr + 0x34);
+    if (g_cheatInfPower) *pCheatFlags |= 0x02u;
+    else                 *pCheatFlags &= ~0x02u;
+}
+
+static bool IsGameWindowFocused();
+static void* GetLivePlayerObject();
+
+static float __cdecl Detour_QueryTimeScale() {
+    if (d3d9_bridge::IsPhotoMode()) {
+        return 0.0f;
+    }
+    if (g_autoPauseUnfocused && !IsGameWindowFocused()) {
+        return 0.0f;
+    }
+    uint32_t gamePtr = *reinterpret_cast<const uint32_t*>(0x007D0090);
+    if (gamePtr < 0x00010000u || IsBadReadPtr(reinterpret_cast<const void*>(gamePtr), 0x118)) return 1.0f;
+    if (*reinterpret_cast<const uint32_t*>(gamePtr + 0x114) == 1u) {
+        return 0.0f;
+    }
+    uint32_t optsPtr = *reinterpret_cast<const uint32_t*>(gamePtr + 0x20);
+    if (optsPtr < 0x00010000u || IsBadReadPtr(reinterpret_cast<const void*>(optsPtr + 0xAC), 4)) return 1.0f;
+    return *reinterpret_cast<const float*>(optsPtr + 0xAC);
+}
+
+static void __fastcall Detour_ICharacterBtvS_Health_Change(void* thisPtr, void* /*edx*/, float delta, uint32_t flag) {
+    if (thisPtr && !IsBadWritePtr(thisPtr, 0x98)) {
+        void* player = GetLivePlayerObject();
+        if (player && thisPtr == player) {
+            if (g_cheatInfHealth && delta < 0.0f) {
+                delta = 0.0f;
+                float maxHp = *reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(thisPtr) + 0x94);
+                if (maxHp > 0.0f) {
+                    *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(thisPtr) + 0x90) = maxHp;
+                }
+            }
+        } else if (player && thisPtr != player) {
+            if (g_cheatOneHitDust && delta < 0.0f) {
+                delta = -9999.0f;
+            }
+        }
+    }
+    typedef void (__thiscall* FnBaseHealthChange)(void*, float, uint32_t);
+    reinterpret_cast<FnBaseHealthChange>(0x0012D450)(thisPtr, delta, flag);
+    if (thisPtr && !IsBadWritePtr(thisPtr, 0x94)) {
+        float* hp = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(thisPtr) + 0x90);
+        if (*hp < -100.0f) *hp = -100.0f;
+    }
+}
+
+static uint8_t __fastcall Detour_IAmmo_UseAmmo(void* thisPtr, void* /*edx*/, uint32_t amount) {
+    if (!thisPtr || IsBadWritePtr(reinterpret_cast<uint8_t*>(thisPtr) + 0xD88, 4)) return 0;
+    uint32_t* pAmmo = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(thisPtr) + 0xD88);
+    if (g_cheatInfAmmo) {
+        if (*pAmmo < amount) *pAmmo = amount;
+        return 1;
+    }
+    if (*pAmmo < amount) return 0;
+    *pAmmo -= amount;
+    return 1;
+}
+
+typedef uint32_t (__thiscall* FnPickupTakeDamage)(void*, void*);
+static FnPickupTakeDamage g_origPickupTakeDamage = nullptr;
+
+static uint32_t __fastcall Detour_IPickup_TakeDamage(void* thisPtr, void* /*edx*/, void* dmgInfo) {
+    if (g_cheatInfAmmo) {
+        return 0;
+    }
+    if (g_origPickupTakeDamage) {
+        return g_origPickupTakeDamage(thisPtr, dmgInfo);
+    }
+    return 0;
+}
+static int           g_mouseSensitivity = 100;
+static bool          g_invertCameraX    = false;
+static bool          g_invertCameraY    = false;
+static volatile LONG g_mouseCaptured    = 0;
+static volatile LONG g_mouseDeltaX      = 0;
+static volatile LONG g_mouseDeltaY      = 0;
+static int           g_keybinds[10]     = { 'W', 'S', 'A', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E', 'Q', 'R' };
 
 struct QuickSaveState {
     uint32_t magic;            // 'BFQS' = 0x53514642
@@ -908,10 +1010,22 @@ static void* GetLivePlayerObject() {
     return player;
 }
 
-static bool ReadQuickSaveState(QuickSaveState& outState) {
+static void GetQuickSaveSlotPath(int slot, char* outBuf, size_t maxLen) {
+    int s = (slot >= 1 && slot <= 5) ? slot : 1;
+    char xboxPath[64]{};
+    std::snprintf(xboxPath, sizeof(xboxPath), "T:\\quicksave_slot%d.bin", s);
+    xboxkrnl::TranslateXboxPath(xboxPath, outBuf, maxLen);
+}
+
+static bool ReadQuickSaveState(QuickSaveState& outState, int slot = 1) {
     char qsPath[512]{};
-    xboxkrnl::TranslateXboxPath("T:\\quicksave.bin", qsPath, sizeof(qsPath));
+    GetQuickSaveSlotPath(slot, qsPath, sizeof(qsPath));
     FILE* f = std::fopen(qsPath, "rb");
+    if (!f && slot == 1) {
+        // Backward compatibility with legacy single-slot T:\quicksave.bin
+        xboxkrnl::TranslateXboxPath("T:\\quicksave.bin", qsPath, sizeof(qsPath));
+        f = std::fopen(qsPath, "rb");
+    }
     if (!f) return false;
     bool ok = (std::fread(&outState, sizeof(QuickSaveState), 1, f) == 1) &&
               (outState.magic == 0x53514642u) &&
@@ -920,9 +1034,9 @@ static bool ReadQuickSaveState(QuickSaveState& outState) {
     return ok;
 }
 
-static bool WriteQuickSaveState(const QuickSaveState& st) {
+static bool WriteQuickSaveState(const QuickSaveState& st, int slot = 1) {
     char qsPath[512]{};
-    xboxkrnl::TranslateXboxPath("T:\\quicksave.bin", qsPath, sizeof(qsPath));
+    GetQuickSaveSlotPath(slot, qsPath, sizeof(qsPath));
     FILE* f = std::fopen(qsPath, "wb");
     if (!f) return false;
     bool ok = (std::fwrite(&st, sizeof(QuickSaveState), 1, f) == 1);
@@ -962,14 +1076,16 @@ static DWORD __stdcall Detour_XGetLaunchInfo(DWORD* pdwLaunchDataType, void* pLa
         if (pLaunchData) std::memcpy(pLaunchData, buf, sizeof(buf));
         LogPrintf("[XAPI] XGetLaunchInfo -> Loaded relaunch LAUNCH_DATA ('%.128s')\n",
                   reinterpret_cast<const char*>(buf));
-        // If this relaunch came from a Quick Load (F6), arm exact player position restore
+        // If this relaunch came from a Quick Load (F6) or in-place costume switch, arm exact player position restore
         char qlFlagPath[512]{};
         xboxkrnl::TranslateXboxPath("T:\\quickload_restore.flag", qlFlagPath, sizeof(qlFlagPath));
         FILE* ff = std::fopen(qlFlagPath, "rb");
         if (ff) {
+            int ch = std::fgetc(ff);
             std::fclose(ff);
             DeleteFileA(qlFlagPath);
-            if (ReadQuickSaveState(g_pendingQuickState) && g_pendingQuickState.hasPlayerMtx) {
+            int slot = (ch >= '1' && ch <= '5') ? (ch - '0') : 1;
+            if (ReadQuickSaveState(g_pendingQuickState, slot) && g_pendingQuickState.hasPlayerMtx) {
                 g_pendingQuickPosRestore = true;
                 g_playerAliveFrames = 0;
             }
@@ -978,7 +1094,7 @@ static DWORD __stdcall Detour_XGetLaunchInfo(DWORD* pdwLaunchDataType, void* pLa
     }
     if (g_autoResumeQuick) {
         QuickSaveState qs{};
-        if (ReadQuickSaveState(qs) && qs.hasLaunchData) {
+        if (ReadQuickSaveState(qs, g_activeSaveSlot) && qs.hasLaunchData) {
             std::memcpy(g_lastLaunchData, qs.launchData, sizeof(qs.launchData));
             g_hasLastLaunchData = true;
             if (qs.hasPlayerMtx) {
@@ -1201,13 +1317,14 @@ static void FlushPendingFovRefresh();
 
 static DWORD __stdcall Detour_XInputGetState(HANDLE /*hDevice*/, XINPUT_STATE_XBOX* pState) {
     FlushPendingFovRefresh();
+    SyncSubtitlesFlagToEngine();
     if (!pState) return ERROR_DEVICE_NOT_CONNECTED;
     static DWORD s_pkt = 1;
     std::memset(pState, 0, sizeof(*pState));
     pState->dwPacketNumber = ++s_pkt;
 
-    // Ignore keyboard & gamepad input whenever another application has focus
-    if (!IsGameWindowFocused()) {
+    // Ignore keyboard & gamepad input whenever another application has focus or Photo Mode is active
+    if (!IsGameWindowFocused() || d3d9_bridge::IsPhotoMode()) {
         return ERROR_SUCCESS;
     }
 
@@ -1251,8 +1368,8 @@ static DWORD __stdcall Detour_XInputGetState(HANDLE /*hDevice*/, XINPUT_STATE_XB
         }
     }
 
-    // 2. Merge Keyboard controls seamlessly so either input works at any time
-    auto keyDown = [](int vk) -> bool { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    // 2. Merge Keyboard & Mouse-Look controls seamlessly so either input works at any time
+    auto keyDown = [](int vk) -> bool { return (vk > 0) && ((GetAsyncKeyState(vk) & 0x8000) != 0); };
 
     if (keyDown(VK_UP))     pState->Gamepad.wButtons |= 0x0001;
     if (keyDown(VK_DOWN))   pState->Gamepad.wButtons |= 0x0002;
@@ -1261,17 +1378,42 @@ static DWORD __stdcall Detour_XInputGetState(HANDLE /*hDevice*/, XINPUT_STATE_XB
     if (keyDown(VK_RETURN)) pState->Gamepad.wButtons |= 0x0010; // START
     if (keyDown(VK_BACK) || keyDown(VK_TAB)) pState->Gamepad.wButtons |= 0x0020; // BACK
 
-    if (keyDown(VK_SPACE) || keyDown('J') || keyDown(VK_RETURN)) pState->Gamepad.bAnalogButtons[0] = 255; // A
-    if (keyDown('K') || keyDown(VK_SHIFT))                       pState->Gamepad.bAnalogButtons[1] = 255; // B
-    if (keyDown('L') || keyDown(VK_CONTROL))                     pState->Gamepad.bAnalogButtons[2] = 255; // X
-    if (keyDown('I') || keyDown('E'))                            pState->Gamepad.bAnalogButtons[3] = 255; // Y
-    if (keyDown('Q'))                                            pState->Gamepad.bAnalogButtons[6] = 255; // LTrigger
-    if (keyDown('O') || keyDown('R'))                            pState->Gamepad.bAnalogButtons[7] = 255; // RTrigger
+    if (keyDown(g_keybinds[4]) || keyDown('J') || keyDown(VK_RETURN)) pState->Gamepad.bAnalogButtons[0] = 255; // A
+    if (keyDown(g_keybinds[5]) || keyDown('K'))                       pState->Gamepad.bAnalogButtons[1] = 255; // B
+    if (keyDown(g_keybinds[6]) || keyDown('L'))                       pState->Gamepad.bAnalogButtons[2] = 255; // X
+    if (keyDown(g_keybinds[7]) || keyDown('I'))                       pState->Gamepad.bAnalogButtons[3] = 255; // Y
+    if (keyDown(g_keybinds[8]))                                       pState->Gamepad.bAnalogButtons[6] = 255; // LTrigger
+    if (keyDown(g_keybinds[9]) || keyDown('O'))                       pState->Gamepad.bAnalogButtons[7] = 255; // RTrigger
 
-    if (keyDown('W')) pState->Gamepad.sThumbLY =  32767;
-    if (keyDown('S')) pState->Gamepad.sThumbLY = -32767;
-    if (keyDown('A')) pState->Gamepad.sThumbLX = -32767;
-    if (keyDown('D')) pState->Gamepad.sThumbLX =  32767;
+    if (keyDown(g_keybinds[0])) pState->Gamepad.sThumbLY =  32767;
+    if (keyDown(g_keybinds[1])) pState->Gamepad.sThumbLY = -32767;
+    if (keyDown(g_keybinds[2])) pState->Gamepad.sThumbLX = -32767;
+    if (keyDown(g_keybinds[3])) pState->Gamepad.sThumbLX =  32767;
+
+    // 3. Mouse-Look Camera (maps mouse movement to right thumbstick + LMB=A / RMB=LT while captured)
+    LONG mdx = InterlockedExchange(&g_mouseDeltaX, 0);
+    LONG mdy = InterlockedExchange(&g_mouseDeltaY, 0);
+    if (g_mouseLookEnabled && g_mouseCaptured) {
+        if (keyDown(VK_LBUTTON)) pState->Gamepad.bAnalogButtons[0] = 255; // Left Click -> A (Attack/Use)
+        if (keyDown(VK_RBUTTON)) pState->Gamepad.bAnalogButtons[6] = 255; // Right Click -> LT (Aim/Lock-on)
+        if (mdx != 0 || mdy != 0) {
+            float scale = 520.0f * (static_cast<float>(g_mouseSensitivity) / 100.0f);
+            int rx = static_cast<int>(pState->Gamepad.sThumbRX) + static_cast<int>(static_cast<float>(mdx) * scale);
+            int ry = static_cast<int>(pState->Gamepad.sThumbRY) - static_cast<int>(static_cast<float>(mdy) * scale);
+            pState->Gamepad.sThumbRX = static_cast<int16_t>(std::max(-32767, std::min(32767, rx)));
+            pState->Gamepad.sThumbRY = static_cast<int16_t>(std::max(-32767, std::min(32767, ry)));
+        }
+    }
+
+    // 4. Camera Invert X / Y (applies cleanly to both Gamepad Right Stick & Mouse-Look)
+    if (g_invertCameraX) {
+        int rx = -static_cast<int>(pState->Gamepad.sThumbRX);
+        pState->Gamepad.sThumbRX = static_cast<int16_t>(std::max(-32767, std::min(32767, rx)));
+    }
+    if (g_invertCameraY) {
+        int ry = -static_cast<int>(pState->Gamepad.sThumbRY);
+        pState->Gamepad.sThumbRY = static_cast<int16_t>(std::max(-32767, std::min(32767, ry)));
+    }
 
     return ERROR_SUCCESS;
 }
@@ -1858,8 +2000,9 @@ static void __stdcall Detour_D3DDevice_Swap(uint32_t Flags) {
         }
     }
 
-    // Handle Quick Save (F5) safely on the main game thread (pure memory read + disk write, zero game calls)
+    // Handle Quick Save (F5 / Slots 1..5) safely on the main game thread
     if (InterlockedExchange(&g_quickSaveReq, 0) != 0) {
+        int slot = g_reqSaveSlot;
         void* player = GetLivePlayerObject();
         if (player || g_hasLastLaunchData) {
             QuickSaveState qs{};
@@ -1874,43 +2017,51 @@ static void __stdcall Detour_D3DDevice_Swap(uint32_t Flags) {
                 qs.hasPlayerMtx = 1u;
                 std::memcpy(qs.playerMtx, static_cast<const uint8_t*>(player) + 0x21C, sizeof(qs.playerMtx));
             }
-            if (WriteQuickSaveState(qs)) {
-                LogPrintf("[QuickSave] Saved exact spot! (level=%u, pos=%u: %.2f, %.2f, %.2f)\n",
-                          qs.hasLaunchData, qs.hasPlayerMtx,
+            if (WriteQuickSaveState(qs, slot)) {
+                LogPrintf("[QuickSave] Saved Slot %d exact spot! (level=%u, pos=%u: %.2f, %.2f, %.2f)\n",
+                          slot, qs.hasLaunchData, qs.hasPlayerMtx,
                           qs.playerMtx[9], qs.playerMtx[10], qs.playerMtx[11]);
-                SetQuickStatusNotice("Quick Saved!");
+                char notice[64]{};
+                std::snprintf(notice, sizeof(notice), "Quick Saved (Slot %d)!", slot);
+                SetQuickStatusNotice(notice);
             } else {
-                LogPrintf("[QuickSave] Failed to write T:\\quicksave.bin!\n");
+                LogPrintf("[QuickSave] Failed to write Slot %d!\n", slot);
             }
         } else {
             LogPrintf("[QuickSave] Not in a level yet — enter gameplay first, then press F5!\n");
         }
     }
 
-    // Handle Quick Load (F6) safely on the main game thread
+    // Handle Quick Load (F6 / Slots 1..5) safely on the main game thread
     if (InterlockedExchange(&g_quickLoadReq, 0) != 0) {
+        int slot = g_reqLoadSlot;
         QuickSaveState qs{};
-        if (ReadQuickSaveState(qs)) {
+        if (ReadQuickSaveState(qs, slot)) {
             void* player = GetLivePlayerObject();
             bool sameLevel = (!qs.hasLaunchData) ||
                              (g_hasLastLaunchData && std::memcmp(qs.launchData, g_lastLaunchData, sizeof(qs.launchData)) == 0);
             if (player && qs.hasPlayerMtx && sameLevel) {
                 ApplyPlayerMatrix(player, qs.playerMtx);
-                LogPrintf("[QuickLoad] Teleported Buffy instantly to saved spot (%.2f, %.2f, %.2f)!\n",
-                          qs.playerMtx[9], qs.playerMtx[10], qs.playerMtx[11]);
-                SetQuickStatusNotice("Quick Loaded!");
+                LogPrintf("[QuickLoad] Teleported Buffy instantly to Slot %d spot (%.2f, %.2f, %.2f)!\n",
+                          slot, qs.playerMtx[9], qs.playerMtx[10], qs.playerMtx[11]);
+                char notice[64]{};
+                std::snprintf(notice, sizeof(notice), "Quick Loaded (Slot %d)!", slot);
+                SetQuickStatusNotice(notice);
             } else if (qs.hasLaunchData) {
                 char qlFlagPath[512]{};
                 xboxkrnl::TranslateXboxPath("T:\\quickload_restore.flag", qlFlagPath, sizeof(qlFlagPath));
                 FILE* ff = std::fopen(qlFlagPath, "wb");
-                if (ff) { std::fputc('1', ff); std::fclose(ff); }
-                LogPrintf("[QuickLoad] Reloading saved level & exact spot...\n");
+                if (ff) { std::fputc('0' + slot, ff); std::fclose(ff); }
+                LogPrintf("[QuickLoad] Reloading Slot %d saved level & exact spot...\n", slot);
                 Detour_XLaunchNewImageA("d:\\default.xbe", qs.launchData);
             } else {
-                LogPrintf("[QuickLoad] Saved state has no level launch data — enter the level first, then press F6!\n");
+                LogPrintf("[QuickLoad] Saved state in Slot %d has no level launch data!\n", slot);
             }
         } else {
-            LogPrintf("[QuickLoad] No Quick Save found yet — press F5 in-game first!\n");
+            LogPrintf("[QuickLoad] Slot %d is empty — press F5 in-game first!\n", slot);
+            char notice[64]{};
+            std::snprintf(notice, sizeof(notice), "Slot %d Empty!", slot);
+            SetQuickStatusNotice(notice);
         }
     }
 
@@ -1925,15 +2076,25 @@ static void __stdcall Detour_D3DDevice_Swap(uint32_t Flags) {
             std::memcpy(qs.launchData, g_lastLaunchData, sizeof(qs.launchData));
             qs.hasPlayerMtx  = 1u;
             std::memcpy(qs.playerMtx, static_cast<const uint8_t*>(player) + 0x21C, sizeof(qs.playerMtx));
-            WriteQuickSaveState(qs);
+            WriteQuickSaveState(qs, g_activeSaveSlot);
             char qlFlagPath[512]{};
             xboxkrnl::TranslateXboxPath("T:\\quickload_restore.flag", qlFlagPath, sizeof(qlFlagPath));
             FILE* ff = std::fopen(qlFlagPath, "wb");
-            if (ff) { std::fputc('1', ff); std::fclose(ff); }
+            if (ff) { std::fputc('0' + g_activeSaveSlot, ff); std::fclose(ff); }
             LogPrintf("[Costume] Reloading current level in-place at (%.2f, %.2f, %.2f) with costume=%u...\n",
                       qs.playerMtx[9], qs.playerMtx[10], qs.playerMtx[11], g_buffyCostume);
             Detour_XLaunchNewImageA("d:\\default.xbe", qs.launchData);
         }
+    }
+
+    // Handle Chapter / Arena Launcher (Game -> Jump to Level / Arena)
+    if (InterlockedExchange(&g_jumpLevelReq, 0) != 0 && g_jumpMapName[0]) {
+        uint8_t launchBuf[3072]{};
+        std::snprintf(reinterpret_cast<char*>(launchBuf), sizeof(launchBuf),
+                      "root:Z:\\ rpecopy:d:\\ controller:0 memoryunit:0 pack:2 session:Buffy sessionload:0 preservebackbuffer:1 preservelogfile:1 map:%s",
+                      g_jumpMapName);
+        LogPrintf("[Launcher] Jumping straight to map '%s'...\n", g_jumpMapName);
+        Detour_XLaunchNewImageA("d:\\default.xbe", launchBuf);
     }
 
     if (g_frameCount == 1 || (g_frameCount % 60) == 0) {
@@ -2414,6 +2575,22 @@ bool LoadAndBridgeDefaultXbe(const char* xbePath) {
     InstallDetour(0x002AC740, &Detour_TTimerManager_GetClocksDeltaAndConvertMs);
     // Engine-native Hor+ widescreen / 21:9 frustum + projection hook
     InstallDetour(0x002A5110, &Detour_View_SetFOV);
+    // Photo Mode / Auto-Pause TimeScale & Fun Cheats / Trainer Detours
+    InstallDetour(0x0008DAC0, &Detour_QueryTimeScale);
+    InstallDetour(0x00204F90, &Detour_ICharacterBtvS_Health_Change);
+    InstallDetour(0x001F0110, &Detour_IAmmo_UseAmmo);
+    {
+        // Build 10-byte executable trampoline for IPickup::Event_TakeDamage (0x000BFC60)
+        uint8_t* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (tramp) {
+            std::memcpy(tramp, reinterpret_cast<const void*>(0x000BFC60), 10);
+            tramp[10] = 0xE9;
+            int32_t rel = static_cast<int32_t>(0x000BFC6Au - reinterpret_cast<uintptr_t>(tramp + 15));
+            std::memcpy(tramp + 11, &rel, 4);
+            g_origPickupTakeDamage = reinterpret_cast<FnPickupTakeDamage>(tramp);
+            InstallDetour(0x000BFC60, &Detour_IPickup_TakeDamage);
+        }
+    }
 
     // 9. Install Xbox Direct3D8 & TIF_Render_Implement Detours
     InstallDetour(0x005966E0, &Detour_Direct3D_CreateDevice);
@@ -2568,16 +2745,46 @@ int ExecuteXboxMain() {
     return mainRes;
 }
 
-void RequestQuickSave() {
+void RequestQuickSave(int slot) {
+    g_reqSaveSlot = (slot >= 1 && slot <= 5) ? slot : g_activeSaveSlot;
     InterlockedExchange(&g_quickSaveReq, 1);
 }
 
-void RequestQuickLoad() {
+void RequestQuickLoad(int slot) {
+    g_reqLoadSlot = (slot >= 1 && slot <= 5) ? slot : g_activeSaveSlot;
     InterlockedExchange(&g_quickLoadReq, 1);
+}
+
+void SetActiveQuickSaveSlot(int slot) {
+    g_activeSaveSlot = (slot >= 1 && slot <= 5) ? slot : 1;
+}
+
+int GetActiveQuickSaveSlot() {
+    return g_activeSaveSlot;
+}
+
+bool HasQuickSaveInSlot(int slot) {
+    QuickSaveState qs{};
+    return ReadQuickSaveState(qs, slot);
+}
+
+void RequestJumpToLevel(const char* mapName) {
+    if (!mapName || !mapName[0]) return;
+    std::strncpy(g_jumpMapName, mapName, sizeof(g_jumpMapName) - 1);
+    g_jumpMapName[sizeof(g_jumpMapName) - 1] = '\0';
+    InterlockedExchange(&g_jumpLevelReq, 1);
 }
 
 void SetAutoResumeQuickSave(bool enabled) {
     g_autoResumeQuick = enabled;
+}
+
+void SetSubtitlesEnabled(bool enabled) {
+    g_subtitlesEnabled = enabled;
+}
+
+bool IsSubtitlesEnabled() {
+    return g_subtitlesEnabled;
 }
 
 void SetBuffyCostume(uint32_t costumeId) {
@@ -2637,6 +2844,37 @@ void SetDeadzonePercent(int percent) {
 
 int GetDeadzonePercent() { return g_deadzonePercent; }
 
+void SetCameraControlSettings(bool mouseLook, int sensitivityPercent, bool invertX, bool invertY) {
+    g_mouseLookEnabled = mouseLook;
+    g_mouseSensitivity = std::max(25, std::min(250, sensitivityPercent));
+    g_invertCameraX    = invertX;
+    g_invertCameraY    = invertY;
+    if (!mouseLook) {
+        InterlockedExchange(&g_mouseCaptured, 0);
+    }
+}
+
+void SetMouseLookCaptured(bool captured) {
+    InterlockedExchange(&g_mouseCaptured, captured ? 1 : 0);
+    if (!captured) {
+        InterlockedExchange(&g_mouseDeltaX, 0);
+        InterlockedExchange(&g_mouseDeltaY, 0);
+    }
+}
+
+void AddMouseLookDelta(int dx, int dy) {
+    if (!g_mouseLookEnabled || !g_mouseCaptured) return;
+    InterlockedExchangeAdd(&g_mouseDeltaX, static_cast<LONG>(dx));
+    InterlockedExchangeAdd(&g_mouseDeltaY, static_cast<LONG>(dy));
+}
+
+void SetKeybinds(const int vkCodes[10]) {
+    if (!vkCodes) return;
+    for (int i = 0; i < 10; ++i) {
+        if (vkCodes[i] > 0) g_keybinds[i] = vkCodes[i];
+    }
+}
+
 bool IsGamepadConnected() { return g_winPadConnected; }
 
 uint32_t GetActivePadSlot() { return static_cast<uint32_t>(g_activeWinPadIndex); }
@@ -2646,6 +2884,24 @@ const char* GetQuickStatusText() {
         return g_quickStatusBuf;
     }
     return "";
+}
+
+void SetAutoPauseUnfocused(bool enabled) {
+    g_autoPauseUnfocused = enabled;
+}
+
+void SetCheats(bool infHealth, bool infPower, bool infAmmoDurability, bool oneHitDust) {
+    g_cheatInfHealth  = infHealth;
+    g_cheatInfPower   = infPower;
+    g_cheatInfAmmo    = infAmmoDurability;
+    g_cheatOneHitDust = oneHitDust;
+    SyncSubtitlesFlagToEngine();
+}
+
+void ShowStatusNotice(const char* msg) {
+    if (!msg || !msg[0]) return;
+    std::snprintf(g_quickStatusBuf, sizeof(g_quickStatusBuf), "%s", msg);
+    g_quickStatusExpireTick = GetTickCount() + 3000;
 }
 
 } // namespace xbe_loader

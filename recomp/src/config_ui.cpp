@@ -3,6 +3,7 @@
 #include "dsound_bridge.h"
 #include "xbe_loader.h"
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -94,10 +95,38 @@ static Palette GetPalette() {
     };
 }
 
+static void SyncWin32PopupMenuTheme(HWND hWnd, bool darkMode) {
+    HMODULE hUx = GetModuleHandleA("uxtheme.dll");
+    if (!hUx) hUx = LoadLibraryA("uxtheme.dll");
+    if (!hUx) return;
+
+    // Ordinal 135: SetPreferredAppMode(PreferredAppMode) -> 1 = AllowDark (follows system Dark/Light mode)
+    typedef int (WINAPI* FnSetPreferredAppMode)(int);
+    auto fnSetPref = reinterpret_cast<FnSetPreferredAppMode>(GetProcAddress(hUx, MAKEINTRESOURCEA(135)));
+    if (fnSetPref) {
+        fnSetPref(darkMode ? 1 : 3); // 1 = AllowDark, 3 = ForceLight
+    }
+
+    // Ordinal 133: AllowDarkModeForWindow(HWND, BOOL)
+    typedef BOOL (WINAPI* FnAllowDarkModeForWindow)(HWND, BOOL);
+    auto fnAllowWin = reinterpret_cast<FnAllowDarkModeForWindow>(GetProcAddress(hUx, MAKEINTRESOURCEA(133)));
+    if (fnAllowWin && hWnd) {
+        fnAllowWin(hWnd, darkMode ? TRUE : FALSE);
+    }
+
+    // Ordinal 136: FlushMenuThemes() — forces Win32 TrackPopupMenu to pick up the dark/light menu theme immediately
+    typedef void (WINAPI* FnFlushMenuThemes)();
+    auto fnFlush = reinterpret_cast<FnFlushMenuThemes>(GetProcAddress(hUx, MAKEINTRESOURCEA(136)));
+    if (fnFlush) {
+        fnFlush();
+    }
+}
+
 void ApplySystemWindowTheme(HWND hWnd) {
     if (!hWnd || !IsWindow(hWnd)) return;
     Palette pal = GetPalette();
     BOOL dark = g_darkMode ? TRUE : FALSE;
+    SyncWin32PopupMenuTheme(hWnd, g_darkMode);
     // DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Win10 2004+ / Win11), fallback 19
     DwmSetWindowAttribute(hWnd, 20, &dark, sizeof(dark));
     DwmSetWindowAttribute(hWnd, 19, &dark, sizeof(dark));
@@ -248,16 +277,80 @@ static LRESULT CALLBACK TopBarWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 ClientToScreen(hWnd, &pt);
                 HMENU hPop = CreatePopupMenu();
                 if (clicked == 0) {
-                    AppendMenuA(hPop, MF_STRING, 101, "Quick Save Exact Spot\tF5");
-                    AppendMenuA(hPop, MF_STRING, 102, "Quick Load Last Spot\tF6");
+                    int activeSlot = g_cfg ? g_cfg->activeSaveSlot : 1;
+                    char qsLbl[64]{}, qlLbl[64]{};
+                    std::snprintf(qsLbl, sizeof(qsLbl), "Quick Save (Slot %d)\tF5", activeSlot);
+                    std::snprintf(qlLbl, sizeof(qlLbl), "Quick Load (Slot %d)\tF6", activeSlot);
+                    AppendMenuA(hPop, MF_STRING, 101, qsLbl);
+                    AppendMenuA(hPop, MF_STRING, 102, qlLbl);
+
+                    // Multi-Slot Quick Save / Load Submenu (Slots 1..5)
+                    HMENU hSlots = CreatePopupMenu();
+                    for (int s = 1; s <= 5; ++s) {
+                        bool has = xbe_loader::HasQuickSaveInSlot(s);
+                        char buf[64]{};
+                        std::snprintf(buf, sizeof(buf), "Save to Slot %d %s", s, has ? "[Saved]" : "[Empty]");
+                        AppendMenuA(hSlots, MF_STRING | (s == activeSlot ? MF_CHECKED : 0), 300 + s, buf);
+                    }
+                    AppendMenuA(hSlots, MF_SEPARATOR, 0, nullptr);
+                    for (int s = 1; s <= 5; ++s) {
+                        bool has = xbe_loader::HasQuickSaveInSlot(s);
+                        char buf[64]{};
+                        std::snprintf(buf, sizeof(buf), "Load Slot %d %s", s, has ? "[Saved]" : "[Empty]");
+                        AppendMenuA(hSlots, MF_STRING | (has ? 0 : MF_GRAYED), 310 + s, buf);
+                    }
+                    AppendMenuA(hPop, MF_POPUP, reinterpret_cast<UINT_PTR>(hSlots), "Quick Save Slots (1-5)");
+
                     AppendMenuA(hPop, MF_STRING | ((g_cfg && g_cfg->autoResumeQuickSave) ? MF_CHECKED : 0),
                                 103, "Auto-Resume Quick Save on Launch");
+                    AppendMenuA(hPop, MF_SEPARATOR, 0, nullptr);
+
+                    // Chapter / Arena Launcher Submenu
+                    static const struct { const char* title; const char* map; } kChapters[] = {
+                        { "Ch. 1: Spanish Mission",      "m00_spanishmission_1" },
+                        { "Ch. 2: Sunnydale High",       "m01_highschool_1" },
+                        { "Ch. 3: The Bronze",           "m02_bronze_0" },
+                        { "Ch. 4: Sunnydale Cemetery",   "m03_cemetery_1" },
+                        { "Ch. 5: Mausoleum",            "m04_mausoleum_1" },
+                        { "Ch. 6: Sunken Building",      "m05_sunken_1" },
+                        { "Ch. 7: Angel's Mansion",      "m06_mansion_1" },
+                        { "Ch. 8: Sunnydale Docks",      "m07_docks_1" },
+                        { "Ch. 9: Return to High School","m08_highschool_1" },
+                        { "Ch. 10: The Foundry",         "m09_foundry_1" },
+                        { "Ch. 11: Sunken Church",       "m10_sunken-church_0" },
+                        { "Ch. 12: Dream Realm",         "m11_dreamrealm_1" },
+                        { "Ch. 13: The Apse (Finale)",   "m12_apse" },
+                        { "Arena 1: Cemetery",           "arena01" },
+                        { "Arena 2: The Bronze",         "arena02" },
+                        { "Arena 3: High School",        "arena03" },
+                        { "Arena 4: Sunken Church",      "arena04" },
+                        { "Extra: Buffy History 101",    "g00_buffyhistory" }
+                    };
+                    HMENU hJump = CreatePopupMenu();
+                    for (int i = 0; i < 18; ++i) {
+                        if (i == 13) AppendMenuA(hJump, MF_SEPARATOR, 0, nullptr);
+                        AppendMenuA(hJump, MF_STRING, 400 + i, kChapters[i].title);
+                    }
+                    AppendMenuA(hPop, MF_POPUP, reinterpret_cast<UINT_PTR>(hJump), "Jump to Level / Arena");
+
+                    // Fun Cheats / Trainer Submenu
+                    HMENU hCheats = CreatePopupMenu();
+                    AppendMenuA(hCheats, MF_STRING | ((g_cfg && g_cfg->cheatInfHealth)  ? MF_CHECKED : 0), 451, "Infinite Health");
+                    AppendMenuA(hCheats, MF_STRING | ((g_cfg && g_cfg->cheatInfPower)   ? MF_CHECKED : 0), 452, "Infinite Slayer Power");
+                    AppendMenuA(hCheats, MF_STRING | ((g_cfg && g_cfg->cheatInfAmmo)    ? MF_CHECKED : 0), 453, "Infinite Weapon Durability / Ammo");
+                    AppendMenuA(hCheats, MF_STRING | ((g_cfg && g_cfg->cheatOneHitDust) ? MF_CHECKED : 0), 454, "One-Hit Dusting");
+                    AppendMenuA(hPop, MF_POPUP, reinterpret_cast<UINT_PTR>(hCheats), "Cheats");
+
                     AppendMenuA(hPop, MF_SEPARATOR, 0, nullptr);
                     AppendMenuA(hPop, MF_STRING, 104, "Configuration...\tF1");
                     AppendMenuA(hPop, MF_SEPARATOR, 0, nullptr);
                     AppendMenuA(hPop, MF_STRING, 105, "Exit\tEsc");
                 } else {
                     AppendMenuA(hPop, MF_STRING, 201, "Fullscreen\tF11");
+                    AppendMenuA(hPop, MF_STRING | (d3d9_bridge::IsPhotoMode() ? MF_CHECKED : 0),
+                                205, "Photo Mode / Free Camera\tF10");
+                    AppendMenuA(hPop, MF_STRING, 206, "Take Screenshot (PNG)\tF12");
+                    AppendMenuA(hPop, MF_SEPARATOR, 0, nullptr);
                     AppendMenuA(hPop, MF_STRING | ((g_cfg && g_cfg->showStatusBar) ? MF_CHECKED : 0),
                                 202, "Show Bottom Status Bar");
                     AppendMenuA(hPop, MF_STRING | ((g_cfg && g_cfg->showDebugLog) ? MF_CHECKED : 0),
@@ -269,6 +362,18 @@ static LRESULT CALLBACK TopBarWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 DestroyMenu(hPop);
                 if (cmd == 101 && g_cb.onQuickSave) g_cb.onQuickSave();
                 else if (cmd == 102 && g_cb.onQuickLoad) g_cb.onQuickLoad();
+                else if (cmd >= 301 && cmd <= 305 && g_cb.onQuickSaveSlot) g_cb.onQuickSaveSlot(static_cast<int>(cmd - 300));
+                else if (cmd >= 311 && cmd <= 315 && g_cb.onQuickLoadSlot) g_cb.onQuickLoadSlot(static_cast<int>(cmd - 310));
+                else if (cmd >= 400 && cmd < 418 && g_cb.onJumpToLevel) {
+                    static const char* kJumpMaps[18] = {
+                        "m00_spanishmission_1", "m01_highschool_1", "m02_bronze_0",
+                        "m03_cemetery_1", "m04_mausoleum_1", "m05_sunken_1",
+                        "m06_mansion_1", "m07_docks_1", "m08_highschool_1",
+                        "m09_foundry_1", "m10_sunken-church_0", "m11_dreamrealm_1",
+                        "m12_apse", "arena01", "arena02", "arena03", "arena04", "g00_buffyhistory"
+                    };
+                    g_cb.onJumpToLevel(kJumpMaps[cmd - 400]);
+                }
                 else if (cmd == 103 && g_cfg && g_cb.onApplyConfig) {
                     g_cfg->autoResumeQuickSave = !g_cfg->autoResumeQuickSave;
                     g_cb.onApplyConfig(*g_cfg, false);
@@ -282,6 +387,21 @@ static LRESULT CALLBACK TopBarWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                     g_cfg->showDebugLog = !g_cfg->showDebugLog;
                     g_cb.onApplyConfig(*g_cfg, true);
                 } else if (cmd == 204 && g_cb.onFrameTrace) g_cb.onFrameTrace();
+                else if (cmd == 205 && g_cb.onTogglePhotoMode) g_cb.onTogglePhotoMode();
+                else if (cmd == 206 && g_cb.onTakeScreenshot) g_cb.onTakeScreenshot();
+                else if (cmd == 451 && g_cfg && g_cb.onApplyConfig) {
+                    g_cfg->cheatInfHealth = !g_cfg->cheatInfHealth;
+                    g_cb.onApplyConfig(*g_cfg, false);
+                } else if (cmd == 452 && g_cfg && g_cb.onApplyConfig) {
+                    g_cfg->cheatInfPower = !g_cfg->cheatInfPower;
+                    g_cb.onApplyConfig(*g_cfg, false);
+                } else if (cmd == 453 && g_cfg && g_cb.onApplyConfig) {
+                    g_cfg->cheatInfAmmo = !g_cfg->cheatInfAmmo;
+                    g_cb.onApplyConfig(*g_cfg, false);
+                } else if (cmd == 454 && g_cfg && g_cb.onApplyConfig) {
+                    g_cfg->cheatOneHitDust = !g_cfg->cheatOneHitDust;
+                    g_cb.onApplyConfig(*g_cfg, false);
+                }
             }
             return 0;
         }
@@ -374,6 +494,9 @@ static void BuildStatusPills(std::vector<StatusPill>& out) {
     out.push_back({ 5, g_cfg->enableHDTextures ? "HD TEX: ON" : "HD TEX: OFF",
                     g_cfg->enableHDTextures ? Gdiplus::Color(255, 24, 64, 38) : Gdiplus::Color(255, 38, 38, 44),
                     g_cfg->enableHDTextures ? Gdiplus::Color(255, 108, 232, 144) : Gdiplus::Color(255, 140, 140, 152), {} });
+    out.push_back({ 8, g_cfg->dumpTextures ? "DUMP: ON" : "DUMP: OFF",
+                    g_cfg->dumpTextures ? Gdiplus::Color(255, 128, 28, 36) : Gdiplus::Color(255, 38, 38, 44),
+                    g_cfg->dumpTextures ? Gdiplus::Color(255, 255, 130, 130) : Gdiplus::Color(255, 140, 140, 152), {} });
     out.push_back({ 6, volBuf,
                     g_cfg->muteAudio ? Gdiplus::Color(255, 38, 38, 44) : Gdiplus::Color(255, 74, 26, 58),
                     g_cfg->muteAudio ? Gdiplus::Color(255, 140, 140, 152) : Gdiplus::Color(255, 255, 128, 208), {} });
@@ -449,6 +572,7 @@ static LRESULT CALLBACK StatusBarWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                         case 3: g_cfg->aniso = (g_cfg->aniso == 1) ? 4 : ((g_cfg->aniso == 4) ? 8 : ((g_cfg->aniso == 8) ? 16 : 1)); break;
                         case 4: g_cfg->atmosphericFog = !g_cfg->atmosphericFog; break;
                         case 5: g_cfg->enableHDTextures = !g_cfg->enableHDTextures; break;
+                        case 8: g_cfg->dumpTextures = !g_cfg->dumpTextures; break;
                         case 6: g_cfg->muteAudio = !g_cfg->muteAudio; break;
                     }
                     g_cb.onApplyConfig(*g_cfg, relayout);
@@ -538,6 +662,7 @@ HWND CreateTopMenuBar(HWND hParent, AppConfig* cfg, const Callbacks* cb) {
     }
     g_hTopBar = CreateWindowExA(0, "BuffyDarkTopBar", "", WS_CHILD | WS_VISIBLE,
                                 0, 0, 800, kTopBarHeight, hParent, nullptr, GetModuleHandleA(nullptr), nullptr);
+    ApplySystemWindowTheme(g_hTopBar);
     return g_hTopBar;
 }
 
@@ -562,7 +687,7 @@ HWND CreateStatusBar(HWND hParent, AppConfig* cfg, const Callbacks* cb) {
 // ============================================================================
 // 3. Modern Dark Buffy Configuration Window (Sidebar + Toggles + Sliders + Dropdowns)
 // ============================================================================
-static const char* kTabNames[6] = { "General", "Graphics", "Textures", "Audio", "Controls", "Debug" };
+static const char* kTabNames[7] = { "General", "Graphics", "Textures", "Audio", "Controls", "Debug", "About" };
 
 enum class CtrlKind { Toggle, Dropdown, Slider, Button, Label };
 struct UiCtrl {
@@ -581,8 +706,35 @@ struct UiCtrl {
 static int                 g_cfgTab      = 0;
 static AppConfig           g_backupCfg{};
 static std::vector<UiCtrl> g_ctrls;
-static int                 g_dragSliderId = -1;
-static int                 g_hoverSide    = -1;
+static int                 g_dragSliderId    = -1;
+static int                 g_hoverSide       = -1;
+static int                 g_rebindingKeyIdx = -1;
+
+static std::string FormatVkName(int vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::string(1, static_cast<char>(vk));
+    if (vk >= '0' && vk <= '9') return std::string(1, static_cast<char>(vk));
+    switch (vk) {
+        case VK_SPACE:   return "Space";
+        case VK_SHIFT:   return "Shift";
+        case VK_CONTROL: return "Ctrl";
+        case VK_MENU:    return "Alt";
+        case VK_RETURN:  return "Enter";
+        case VK_TAB:     return "Tab";
+        case VK_BACK:    return "Bksp";
+        case VK_UP:      return "Up";
+        case VK_DOWN:    return "Down";
+        case VK_LEFT:    return "Left";
+        case VK_RIGHT:   return "Right";
+        default: {
+            UINT sc = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+            char name[32]{};
+            if (sc && GetKeyNameTextA(static_cast<LONG>(sc << 16), name, sizeof(name)) > 0) return name;
+            char hex[16]{};
+            std::snprintf(hex, sizeof(hex), "0x%02X", vk & 0xFF);
+            return hex;
+        }
+    }
+}
 static int                 g_hoverCtrlId  = -1;
 static RECT                g_rcBtnOk{};
 static RECT                g_rcBtnCancel{};
@@ -643,6 +795,8 @@ static void RebuildConfigControls(int w, int h) {
         addLabel("  (Automatically reloads your current spot with the new outfit)");
         y += 4;
         addToggle(101, "Auto-Resume Quick Save on Launch", g_cfg->autoResumeQuickSave);
+        addToggle(108, "Show Cutscene Subtitles",          g_cfg->subtitlesEnabled);
+        addToggle(109, "Pause Game When Unfocused (Alt-Tab)", g_cfg->autoPauseUnfocused);
         addToggle(102, "Hide Mouse Cursor on Inactivity",  g_cfg->hideMouseInactivity);
         addToggle(103, "Show Bottom Status Bar",           g_cfg->showStatusBar);
         y += 12;
@@ -668,16 +822,20 @@ static void RebuildConfigControls(int w, int h) {
         addDropdown(203, "Frame Rate Limit:",      fpsStr);
         addDropdown(204, "Anti-Aliasing:",         msaaStr);
         addDropdown(205, "Anisotropic Filtering:", afStr);
-        y += 6;
+        y += 2;
         addToggle(206, "Atmospheric Distance Fog", g_cfg->atmosphericFog);
         addToggle(210, "Subtle Soft Bloom (Lanterns / Magic)", g_cfg->softBloom);
-        y += 6;
-        char fovTxt[16]{}, gamTxt[16]{}, briTxt[16]{}, conTxt[16]{};
-        std::snprintf(fovTxt, sizeof(fovTxt), "%+d\xB0", g_cfg->fovOffsetDeg);
+        addToggle(213, "Cinema Vignette (Gothic Edge Darkening)", g_cfg->cinemaVignette);
+        addToggle(214, "Retro 480p CRT Scanlines", g_cfg->crtScanlines);
+        y += 2;
+        char fovTxt[16]{}, shpTxt[16]{}, gamTxt[16]{}, briTxt[16]{}, conTxt[16]{};
+        std::snprintf(fovTxt, sizeof(fovTxt), "%+d\xC2\xB0", g_cfg->fovOffsetDeg);
+        std::snprintf(shpTxt, sizeof(shpTxt), "%d%%", g_cfg->sharpnessPercent);
         std::snprintf(gamTxt, sizeof(gamTxt), "%.2f", g_cfg->gammaPercent / 100.0f);
         std::snprintf(briTxt, sizeof(briTxt), "%+d%%", g_cfg->brightnessPercent - 100);
         std::snprintf(conTxt, sizeof(conTxt), "%d%%", g_cfg->contrastPercent);
         addSlider(211, "Camera FOV Offset:", g_cfg->fovOffsetDeg,      -15, 25,  fovTxt);
+        addSlider(212, "Sharpness (CAS):",   g_cfg->sharpnessPercent,    0, 100, shpTxt);
         addSlider(207, "Gamma (CRT Lift):",  g_cfg->gammaPercent,       50, 200, gamTxt);
         addSlider(208, "Brightness:",        g_cfg->brightnessPercent,  50, 150, briTxt);
         addSlider(209, "Contrast:",          g_cfg->contrastPercent,    50, 150, conTxt);
@@ -699,23 +857,57 @@ static void RebuildConfigControls(int w, int h) {
     } else if (g_cfgTab == 4) { // Controls
         char padTxt[96]{};
         if (xbe_loader::IsGamepadConnected()) {
-            std::snprintf(padTxt, sizeof(padTxt), "Controller Status: Connected (Xbox Controller %u)", xbe_loader::GetActivePadSlot());
+            std::snprintf(padTxt, sizeof(padTxt), "Controller: Connected (Xbox Pad %u)  |  Mouse-Look: Click Viewport, Alt/Esc Releases", xbe_loader::GetActivePadSlot());
         } else {
-            std::snprintf(padTxt, sizeof(padTxt), "Controller Status: No Xbox Pad detected (Keyboard Active)");
+            std::snprintf(padTxt, sizeof(padTxt), "Controller: Keyboard & Mouse Active  |  Mouse-Look: Click Viewport, Alt/Esc Releases");
         }
         addLabel(padTxt);
-        y += 6;
         addToggle(501, "Controller Vibration / Rumble", g_cfg->rumbleEnabled);
         char dzTxt[16]{};
         std::snprintf(dzTxt, sizeof(dzTxt), "%d%%", g_cfg->deadzonePercent);
         addSlider(502, "Analog Stick Deadzone:", g_cfg->deadzonePercent, 0, 40, dzTxt);
-        y += 12;
-        addLabel("Keyboard: WASD Move | Space/J=A | Shift/K=B | Ctrl/L=X | E/I=Y | Q=LT | R=RT | Enter=Start");
-        addLabel("Hotkeys:  F1 Config | F5 Quick Save | F6 Quick Load | F11 Fullscreen | Esc Exit");
+        addToggle(503, "Mouse-Look Camera (LMB=Attack, RMB=Aim)", g_cfg->mouseLookEnabled);
+        char sensTxt[16]{};
+        std::snprintf(sensTxt, sizeof(sensTxt), "%d%%", g_cfg->mouseSensitivity);
+        addSlider(504, "Mouse-Look Sensitivity:", g_cfg->mouseSensitivity, 25, 250, sensTxt);
+        addToggle(505, "Invert Camera Horizontal (X)", g_cfg->invertCameraX);
+        addToggle(506, "Invert Camera Vertical (Y)",   g_cfg->invertCameraY);
+        y += 4;
+        static const char* kBindNames[10] = {
+            "Move Fwd", "Move Back", "Move Left", "Move Right",
+            "A (Action)", "B (Punch)", "X (Stake)", "Y (Jump)",
+            "LT (Aim)", "RT (Power)"
+        };
+        for (int i = 0; i < 10; i += 2) {
+            char bL[48]{}, bR[48]{};
+            std::snprintf(bL, sizeof(bL), "%s: %s", kBindNames[i],
+                          (g_rebindingKeyIdx == i) ? "[Press Key...]" : FormatVkName(g_cfg->keybinds[i]).c_str());
+            std::snprintf(bR, sizeof(bR), "%s: %s", kBindNames[i + 1],
+                          (g_rebindingKeyIdx == i + 1) ? "[Press Key...]" : FormatVkName(g_cfg->keybinds[i + 1]).c_str());
+            addButton(510 + i,     bL, leftX,       252);
+            addButton(510 + i + 1, bR, leftX + 264, 252);
+            y += 35;
+        }
+        addButton(520, "Reset Default Keybinds", leftX, 185);
     } else if (g_cfgTab == 5) { // Debug
         addToggle(601, "Show Debug Telemetry Log (F2)", g_cfg->showDebugLog);
         y += 12;
         addButton(602, "Trace 1 Frame to Log (F7)", leftX, 200);
+    } else if (g_cfgTab == 6) { // About
+        // Top 132px reserved for centered BtVS logo emblem drawn in WM_PAINT
+        y += 136;
+        addLabel("Buffy the Vampire Slayer (Original Xbox) - Native Win32 Recomp & Runtime");
+        addLabel("Hardware Direct3D 9 HD Renderer, 48 kHz waveOut Audio, XInput & Mouse-Look.");
+        y += 6;
+        addLabel("Author: FallenAzazel");
+        y += 8;
+        int btnW = 360;
+        int btnX = leftX + (contentW - btnW) / 2;
+        addButton(701, "GitHub: github.com/FallenAzazel/BtVS_recomp", btnX, btnW);
+        y += 46;
+        addLabel("Disclaimer: No copyrighted game assets, binaries, audio, or textures are");
+        addLabel("included in this repository or runtime. You must supply your own legally");
+        addLabel("owned copy of Buffy the Vampire Slayer (Original Xbox) to play.");
     }
 
     g_rcBtnCancel = { w - 104, h - 42, w - 16,  h - 12 };
@@ -788,11 +980,15 @@ static void UpdateSliderFromX(const UiCtrl& c, int mx) {
         g_cfg->contrastPercent = v;
     } else if (c.id == 211) {
         g_cfg->fovOffsetDeg = v;
+    } else if (c.id == 212) {
+        g_cfg->sharpnessPercent = v;
     } else if (c.id == 401) {
         g_cfg->masterVolume = v;
         if (v > 0) g_cfg->muteAudio = false;
     } else if (c.id == 502) {
         g_cfg->deadzonePercent = v;
+    } else if (c.id == 504) {
+        g_cfg->mouseSensitivity = v;
     }
     g_cb.onApplyConfig(*g_cfg, false);
 }
@@ -817,7 +1013,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
             }
             int ns = -1;
             if (x >= 12 && x < 152) {
-                for (int i = 0; i < 6; ++i) {
+                for (int i = 0; i < 7; ++i) {
                     int sy = 16 + i * 38;
                     if (y >= sy && y < sy + 32) { ns = i; break; }
                 }
@@ -861,7 +1057,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 
             // Sidebar tabs
             if (x >= 12 && x < 152) {
-                for (int i = 0; i < 6; ++i) {
+                for (int i = 0; i < 7; ++i) {
                     int sy = 16 + i * 38;
                     if (y >= sy && y < sy + 32) {
                         g_cfgTab = i;
@@ -893,15 +1089,22 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                     } else if (c.kind == CtrlKind::Toggle && g_cfg && g_cb.onApplyConfig) {
                         bool relayout = false;
                         if (c.id == 101) g_cfg->autoResumeQuickSave = !g_cfg->autoResumeQuickSave;
+                        else if (c.id == 108) g_cfg->subtitlesEnabled = !g_cfg->subtitlesEnabled;
+                        else if (c.id == 109) g_cfg->autoPauseUnfocused = !g_cfg->autoPauseUnfocused;
                         else if (c.id == 102) g_cfg->hideMouseInactivity = !g_cfg->hideMouseInactivity;
                         else if (c.id == 103) { g_cfg->showStatusBar = !g_cfg->showStatusBar; relayout = true; }
                         else if (c.id == 206) g_cfg->atmosphericFog = !g_cfg->atmosphericFog;
                         else if (c.id == 210) g_cfg->softBloom = !g_cfg->softBloom;
+                        else if (c.id == 213) g_cfg->cinemaVignette = !g_cfg->cinemaVignette;
+                        else if (c.id == 214) g_cfg->crtScanlines = !g_cfg->crtScanlines;
                         else if (c.id == 301) g_cfg->enableHDTextures = !g_cfg->enableHDTextures;
                         else if (c.id == 302) g_cfg->dumpTextures = !g_cfg->dumpTextures;
                         else if (c.id == 402) g_cfg->muteAudio = !g_cfg->muteAudio;
                         else if (c.id == 403) g_cfg->muteInBackground = !g_cfg->muteInBackground;
                         else if (c.id == 501) g_cfg->rumbleEnabled = !g_cfg->rumbleEnabled;
+                        else if (c.id == 503) g_cfg->mouseLookEnabled = !g_cfg->mouseLookEnabled;
+                        else if (c.id == 505) g_cfg->invertCameraX = !g_cfg->invertCameraX;
+                        else if (c.id == 506) g_cfg->invertCameraY = !g_cfg->invertCameraY;
                         else if (c.id == 601) { g_cfg->showDebugLog = !g_cfg->showDebugLog; relayout = true; }
                         g_cb.onApplyConfig(*g_cfg, relayout);
                         InvalidateRect(hWnd, nullptr, FALSE);
@@ -916,7 +1119,21 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                         else if (c.id == 303 && g_cb.onReloadHD) g_cb.onReloadHD();
                         else if (c.id == 304 && g_cb.onOpenHDFolder) g_cb.onOpenHDFolder();
                         else if (c.id == 305 && g_cb.onOpenDumpFolder) g_cb.onOpenDumpFolder();
+                        else if (c.id >= 510 && c.id <= 519) {
+                            g_rebindingKeyIdx = c.id - 510;
+                            InvalidateRect(hWnd, nullptr, FALSE);
+                        } else if (c.id == 520 && g_cfg && g_cb.onApplyConfig) {
+                            static const int kDef[10] = { 'W', 'S', 'A', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E', 'Q', 'R' };
+                            for (int i = 0; i < 10; ++i) g_cfg->keybinds[i] = kDef[i];
+                            g_rebindingKeyIdx = -1;
+                            g_cb.onApplyConfig(*g_cfg, false);
+                            InvalidateRect(hWnd, nullptr, FALSE);
+                        }
                         else if (c.id == 602 && g_cb.onFrameTrace) g_cb.onFrameTrace();
+                        else if (c.id == 701) {
+                            ShellExecuteA(hWnd, "open", "https://github.com/FallenAzazel/BtVS_recomp",
+                                          nullptr, nullptr, SW_SHOWNORMAL);
+                        }
                     }
                     return 0;
                 }
@@ -924,6 +1141,15 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
             return 0;
         }
         case WM_KEYDOWN:
+            if (g_rebindingKeyIdx >= 0 && g_rebindingKeyIdx < 10 && g_cfg && g_cb.onApplyConfig) {
+                if (wParam != VK_ESCAPE) {
+                    g_cfg->keybinds[g_rebindingKeyIdx] = static_cast<int>(wParam);
+                    g_cb.onApplyConfig(*g_cfg, false);
+                }
+                g_rebindingKeyIdx = -1;
+                InvalidateRect(hWnd, nullptr, FALSE);
+                return 0;
+            }
             if (wParam == VK_ESCAPE) {
                 DestroyWindow(hWnd);
                 return 0;
@@ -958,7 +1184,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                     g.DrawLine(&sep, 0, h - 54, w, h - 54);
 
                     // Sidebar tab buttons
-                    for (int i = 0; i < 6; ++i) {
+                    for (int i = 0; i < 7; ++i) {
                         float sy = static_cast<float>(16 + i * 38);
                         bool sel = (i == g_cfgTab);
                         if (sel) {
@@ -976,6 +1202,49 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                     Gdiplus::Pen accPen(pal.accent, 2.0f);
                     g.DrawLine(&accPen, 186, 44, 266, 44);
                     g.DrawLine(&sep, 186, 45, w - 24, 45);
+
+                    // Centered stylized BtVS logo emblem at top of About panel
+                    if (g_cfgTab == 6) {
+                        float panelL = 186.0f;
+                        float panelW = static_cast<float>(w - 210);
+                        float logoW  = 340.0f;
+                        float logoH  = 112.0f;
+                        float logoX  = panelL + (panelW - logoW) * 0.5f;
+                        float logoY  = 60.0f;
+
+                        // Dark crimson crest backdrop with glowing accent frame
+                        FillRoundRect(g, logoX, logoY, logoW, logoH, 12.0f, Gdiplus::Color(255, 34, 14, 26));
+                        Gdiplus::Pen crestPen(pal.accent, 1.8f);
+                        Gdiplus::GraphicsPath crestPath;
+                        crestPath.AddArc(logoX, logoY, 24.0f, 24.0f, 180.0f, 90.0f);
+                        crestPath.AddArc(logoX + logoW - 24.0f, logoY, 24.0f, 24.0f, 270.0f, 90.0f);
+                        crestPath.AddArc(logoX + logoW - 24.0f, logoY + logoH - 24.0f, 24.0f, 24.0f, 0.0f, 90.0f);
+                        crestPath.AddArc(logoX, logoY + logoH - 24.0f, 24.0f, 24.0f, 90.0f, 90.0f);
+                        crestPath.CloseFigure();
+                        g.DrawPath(&crestPen, &crestPath);
+
+                        // Stylized Gothic "BtVS" / "BUFFY THE VAMPIRE SLAYER" wordmark
+                        Gdiplus::StringFormat sfCenter;
+                        sfCenter.SetAlignment(Gdiplus::StringAlignmentCenter);
+                        sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+
+                        Gdiplus::Font fBuffy(L"Georgia", 26.0f, Gdiplus::FontStyleBold | Gdiplus::FontStyleItalic, Gdiplus::UnitPoint);
+                        Gdiplus::SolidBrush brGlow(Gdiplus::Color(110, 233, 30, 99));
+                        Gdiplus::SolidBrush brTitle(Gdiplus::Color(255, 250, 235, 245));
+                        g.DrawString(L"BUFFY", -1, &fBuffy, Gdiplus::RectF(logoX + 2.0f, logoY + 12.0f, logoW, 44.0f), &sfCenter, &brGlow);
+                        g.DrawString(L"BUFFY", -1, &fBuffy, Gdiplus::RectF(logoX, logoY + 10.0f, logoW, 44.0f), &sfCenter, &brTitle);
+
+                        Gdiplus::Font fSub(L"Georgia", 10.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+                        Gdiplus::SolidBrush brSub(Gdiplus::Color(255, 233, 90, 145));
+                        g.DrawString(L"THE VAMPIRE SLAYER", -1, &fSub, Gdiplus::RectF(logoX, logoY + 54.0f, logoW, 24.0f), &sfCenter, &brSub);
+
+                        Gdiplus::Pen divPen(Gdiplus::Color(120, 233, 30, 99), 1.0f);
+                        g.DrawLine(&divPen, logoX + 52.0f, logoY + 80.0f, logoX + logoW - 52.0f, logoY + 80.0f);
+
+                        Gdiplus::Font fTag(L"Segoe UI", 8.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+                        Gdiplus::SolidBrush brTag(pal.textDim);
+                        g.DrawString(L"BtVS  \x2022  XBOX TO WIN32 RECOMP", -1, &fTag, Gdiplus::RectF(logoX, logoY + 84.0f, logoW, 22.0f), &sfCenter, &brTag);
+                    }
 
                     // Controls
                     for (const auto& c : g_ctrls) {
@@ -1071,7 +1340,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int initialTab) {
     if (cfg) g_cfg = cfg;
     if (cb)  g_cb  = *cb;
-    if (initialTab >= 0 && initialTab < 6) g_cfgTab = initialTab;
+    if (initialTab >= 0 && initialTab < 7) g_cfgTab = initialTab;
 
     if (g_hCfgWnd && IsWindow(g_hCfgWnd)) {
         SetForegroundWindow(g_hCfgWnd);
@@ -1091,7 +1360,7 @@ void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int init
         reg = true;
     }
 
-    int dw = 740, dh = 610;
+    int dw = 740, dh = 725;
     RECT rcOwner{};
     int px = CW_USEDEFAULT, py = CW_USEDEFAULT;
     if (hOwner && GetWindowRect(hOwner, &rcOwner)) {

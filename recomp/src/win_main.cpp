@@ -34,10 +34,22 @@ static std::vector<uint32_t> g_gameFramebuffer(640 * 480, 0x00101420u);
 static std::string           g_settingsIniPath;
 static std::string           g_hdTexDirPath;
 static std::string           g_dumpTexDirPath;
+static std::string           g_screenshotsDirPath;
 static config_ui::AppConfig  g_cfg{};
 static config_ui::Callbacks  g_uiCb{};
 static DWORD                 g_lastMouseMoveTick = 0;
 static bool                  g_cursorHidden      = false;
+static bool                  g_mouseLookCaptured = false;
+
+static void ReleaseMouseLookCapture() {
+    if (g_mouseLookCaptured) {
+        g_mouseLookCaptured = false;
+        xbe_loader::SetMouseLookCaptured(false);
+        ClipCursor(nullptr);
+        while (ShowCursor(TRUE) < 0) {}
+        g_cursorHidden = false;
+    }
+}
 
 static void LoadSettingsIni() {
     if (g_settingsIniPath.empty()) return;
@@ -53,6 +65,9 @@ static void LoadSettingsIni() {
     g_cfg.targetFps           = GetPrivateProfileIntA("Graphics", "TargetFPS",           60,        g_settingsIniPath.c_str());
     g_cfg.atmosphericFog      = GetPrivateProfileIntA("Graphics", "AtmosphericFog",      1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.softBloom           = GetPrivateProfileIntA("Graphics", "SoftBloom",           0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.cinemaVignette      = GetPrivateProfileIntA("Graphics", "CinemaVignette",      0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.crtScanlines        = GetPrivateProfileIntA("Graphics", "CrtScanlines",        0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.sharpnessPercent    = GetPrivateProfileIntA("Graphics", "Sharpness",           35,        g_settingsIniPath.c_str());
     g_cfg.fovOffsetDeg        = static_cast<int>(GetPrivateProfileIntA("Graphics", "FovOffset", 0,  g_settingsIniPath.c_str()));
     g_cfg.gammaPercent        = GetPrivateProfileIntA("Graphics", "Gamma",               100,       g_settingsIniPath.c_str());
     g_cfg.brightnessPercent   = GetPrivateProfileIntA("Graphics", "Brightness",          100,       g_settingsIniPath.c_str());
@@ -61,12 +76,31 @@ static void LoadSettingsIni() {
     g_cfg.autoResumeQuickSave = GetPrivateProfileIntA("Game",     "AutoResumeQuickSave", 0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.hideMouseInactivity = GetPrivateProfileIntA("Game",     "HideMouseInactivity", 1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.showStatusBar       = GetPrivateProfileIntA("Game",     "ShowStatusBar",       1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.subtitlesEnabled    = GetPrivateProfileIntA("Game",     "Subtitles",           1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.autoPauseUnfocused  = GetPrivateProfileIntA("Game",     "AutoPauseUnfocused",  0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.buffyCostume        = GetPrivateProfileIntA("Game",     "BuffyCostume",        0,         g_settingsIniPath.c_str());
+    g_cfg.cheatInfHealth      = GetPrivateProfileIntA("Cheats",   "InfHealth",           0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.cheatInfPower       = GetPrivateProfileIntA("Cheats",   "InfPower",            0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.cheatInfAmmo        = GetPrivateProfileIntA("Cheats",   "InfAmmo",             0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.cheatOneHitDust     = GetPrivateProfileIntA("Cheats",   "OneHitDust",          0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.masterVolume        = GetPrivateProfileIntA("Audio",    "MasterVolume",        100,       g_settingsIniPath.c_str());
     g_cfg.muteAudio           = GetPrivateProfileIntA("Audio",    "MuteAudio",           0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.muteInBackground    = GetPrivateProfileIntA("Audio",    "MuteInBackground",    0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.rumbleEnabled       = GetPrivateProfileIntA("Controls", "RumbleEnabled",       1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.deadzonePercent     = GetPrivateProfileIntA("Controls", "DeadzonePercent",     15,        g_settingsIniPath.c_str());
+    g_cfg.mouseLookEnabled    = GetPrivateProfileIntA("Controls", "MouseLook",           0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.mouseSensitivity    = GetPrivateProfileIntA("Controls", "MouseSensitivity",    100,       g_settingsIniPath.c_str());
+    g_cfg.invertCameraX       = GetPrivateProfileIntA("Controls", "InvertCameraX",       0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.invertCameraY       = GetPrivateProfileIntA("Controls", "InvertCameraY",       0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.activeSaveSlot      = GetPrivateProfileIntA("Game",     "ActiveSaveSlot",      1,         g_settingsIniPath.c_str());
+    {
+        static const int kDefKeys[10] = { 'W', 'S', 'A', 'D', VK_SPACE, VK_SHIFT, VK_CONTROL, 'E', 'Q', 'R' };
+        for (int i = 0; i < 10; ++i) {
+            char keyName[16]{};
+            std::snprintf(keyName, sizeof(keyName), "Key%d", i);
+            g_cfg.keybinds[i] = GetPrivateProfileIntA("Keybinds", keyName, kDefKeys[i], g_settingsIniPath.c_str());
+        }
+    }
 
     if (g_cfg.resScale < 1 || g_cfg.resScale > 4) g_cfg.resScale = defScale;
     if (g_cfg.aspectMode > 2) g_cfg.aspectMode = defAspect;
@@ -75,7 +109,10 @@ static void LoadSettingsIni() {
     if (g_cfg.targetFps != 0 && g_cfg.targetFps != 30 && g_cfg.targetFps != 60 && g_cfg.targetFps != 120 && g_cfg.targetFps != 165) g_cfg.targetFps = 60;
     if (g_cfg.masterVolume < 0 || g_cfg.masterVolume > 100) g_cfg.masterVolume = 100;
     if (g_cfg.deadzonePercent < 0 || g_cfg.deadzonePercent > 40) g_cfg.deadzonePercent = 15;
+    if (g_cfg.mouseSensitivity < 25 || g_cfg.mouseSensitivity > 250) g_cfg.mouseSensitivity = 100;
+    if (g_cfg.activeSaveSlot < 1 || g_cfg.activeSaveSlot > 5) g_cfg.activeSaveSlot = 1;
     if (g_cfg.fovOffsetDeg < -15 || g_cfg.fovOffsetDeg > 25) g_cfg.fovOffsetDeg = 0;
+    if (g_cfg.sharpnessPercent < 0 || g_cfg.sharpnessPercent > 100) g_cfg.sharpnessPercent = 35;
     if (g_cfg.gammaPercent < 50 || g_cfg.gammaPercent > 200) g_cfg.gammaPercent = 100;
     if (g_cfg.brightnessPercent < 50 || g_cfg.brightnessPercent > 150) g_cfg.brightnessPercent = 100;
     if (g_cfg.contrastPercent < 50 || g_cfg.contrastPercent > 150) g_cfg.contrastPercent = 100;
@@ -96,6 +133,9 @@ static void SaveSettingsIni() {
     writeU("Graphics", "TargetFPS",           static_cast<int>(g_cfg.targetFps));
     writeU("Graphics", "AtmosphericFog",      g_cfg.atmosphericFog ? 1 : 0);
     writeU("Graphics", "SoftBloom",           g_cfg.softBloom ? 1 : 0);
+    writeU("Graphics", "CinemaVignette",      g_cfg.cinemaVignette ? 1 : 0);
+    writeU("Graphics", "CrtScanlines",        g_cfg.crtScanlines ? 1 : 0);
+    writeU("Graphics", "Sharpness",           g_cfg.sharpnessPercent);
     writeU("Graphics", "FovOffset",           g_cfg.fovOffsetDeg);
     writeU("Graphics", "Gamma",               g_cfg.gammaPercent);
     writeU("Graphics", "Brightness",          g_cfg.brightnessPercent);
@@ -104,12 +144,28 @@ static void SaveSettingsIni() {
     writeU("Game",     "AutoResumeQuickSave", g_cfg.autoResumeQuickSave ? 1 : 0);
     writeU("Game",     "HideMouseInactivity", g_cfg.hideMouseInactivity ? 1 : 0);
     writeU("Game",     "ShowStatusBar",       g_cfg.showStatusBar ? 1 : 0);
+    writeU("Game",     "Subtitles",           g_cfg.subtitlesEnabled ? 1 : 0);
+    writeU("Game",     "AutoPauseUnfocused",  g_cfg.autoPauseUnfocused ? 1 : 0);
     writeU("Game",     "BuffyCostume",        static_cast<int>(g_cfg.buffyCostume));
+    writeU("Cheats",   "InfHealth",           g_cfg.cheatInfHealth ? 1 : 0);
+    writeU("Cheats",   "InfPower",            g_cfg.cheatInfPower ? 1 : 0);
+    writeU("Cheats",   "InfAmmo",             g_cfg.cheatInfAmmo ? 1 : 0);
+    writeU("Cheats",   "OneHitDust",          g_cfg.cheatOneHitDust ? 1 : 0);
     writeU("Audio",    "MasterVolume",        g_cfg.masterVolume);
     writeU("Audio",    "MuteAudio",           g_cfg.muteAudio ? 1 : 0);
     writeU("Audio",    "MuteInBackground",    g_cfg.muteInBackground ? 1 : 0);
     writeU("Controls", "RumbleEnabled",       g_cfg.rumbleEnabled ? 1 : 0);
     writeU("Controls", "DeadzonePercent",     g_cfg.deadzonePercent);
+    writeU("Controls", "MouseLook",           g_cfg.mouseLookEnabled ? 1 : 0);
+    writeU("Controls", "MouseSensitivity",    g_cfg.mouseSensitivity);
+    writeU("Controls", "InvertCameraX",       g_cfg.invertCameraX ? 1 : 0);
+    writeU("Controls", "InvertCameraY",       g_cfg.invertCameraY ? 1 : 0);
+    writeU("Game",     "ActiveSaveSlot",      g_cfg.activeSaveSlot);
+    for (int i = 0; i < 10; ++i) {
+        char keyName[16]{};
+        std::snprintf(keyName, sizeof(keyName), "Key%d", i);
+        writeU("Keybinds", keyName, g_cfg.keybinds[i]);
+    }
 }
 
 static void LayoutMainWindow(HWND hWnd);
@@ -120,15 +176,23 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     d3d9_bridge::RequestGraphicsSettings(g_cfg.resScale, g_cfg.msaa, g_cfg.aniso, g_cfg.aspectMode);
     d3d9_bridge::SetFogEnabled(g_cfg.atmosphericFog);
     d3d9_bridge::SetBloomEnabled(g_cfg.softBloom);
+    d3d9_bridge::SetSharpnessPercent(g_cfg.sharpnessPercent);
+    d3d9_bridge::SetPostEffects(g_cfg.cinemaVignette, g_cfg.crtScanlines);
     d3d9_bridge::SetColorCorrection(g_cfg.gammaPercent, g_cfg.brightnessPercent, g_cfg.contrastPercent);
     xbe_loader::SetFovOffsetDeg(g_cfg.fovOffsetDeg);
     d3d9_bridge::SetHDTexturesEnabled(g_cfg.enableHDTextures);
     d3d9_bridge::SetTextureDumpEnabled(g_cfg.dumpTextures);
     xbe_loader::SetAutoResumeQuickSave(g_cfg.autoResumeQuickSave);
+    xbe_loader::SetSubtitlesEnabled(g_cfg.subtitlesEnabled);
+    xbe_loader::SetAutoPauseUnfocused(g_cfg.autoPauseUnfocused);
+    xbe_loader::SetCheats(g_cfg.cheatInfHealth, g_cfg.cheatInfPower, g_cfg.cheatInfAmmo, g_cfg.cheatOneHitDust);
     xbe_loader::SetBuffyCostume(g_cfg.buffyCostume);
     xbe_loader::SetTargetFps(g_cfg.targetFps);
     xbe_loader::SetRumbleEnabled(g_cfg.rumbleEnabled);
     xbe_loader::SetDeadzonePercent(g_cfg.deadzonePercent);
+    xbe_loader::SetCameraControlSettings(g_cfg.mouseLookEnabled, g_cfg.mouseSensitivity, g_cfg.invertCameraX, g_cfg.invertCameraY);
+    xbe_loader::SetKeybinds(g_cfg.keybinds);
+    xbe_loader::SetActiveQuickSaveSlot(g_cfg.activeSaveSlot);
     dsound_bridge::SetMasterVolume(g_cfg.masterVolume);
     dsound_bridge::SetMuted(g_cfg.muteAudio);
     dsound_bridge::SetMuteInBackground(g_cfg.muteInBackground);
@@ -451,7 +515,53 @@ static LRESULT CALLBACK BuffyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             InvalidateRect(hWnd, nullptr, TRUE);
             return 0;
         }
+        case WM_LBUTTONDOWN: {
+            if ((g_cfg.mouseLookEnabled || d3d9_bridge::IsPhotoMode()) && g_hRenderWnd && !g_mouseLookCaptured) {
+                POINT pt{};
+                GetCursorPos(&pt);
+                RECT rcRender{};
+                if (GetWindowRect(g_hRenderWnd, &rcRender) && PtInRect(&rcRender, pt)) {
+                    g_mouseLookCaptured = true;
+                    xbe_loader::SetMouseLookCaptured(true);
+                    ClipCursor(&rcRender);
+                    int cx = (rcRender.left + rcRender.right) / 2;
+                    int cy = (rcRender.top  + rcRender.bottom) / 2;
+                    SetCursorPos(cx, cy);
+                    EnsureCursorVisible(false);
+                }
+            }
+            break;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE) ReleaseMouseLookCapture();
+            break;
+        case WM_KILLFOCUS:
+            ReleaseMouseLookCapture();
+            break;
+        case WM_SYSKEYDOWN:
+            if (wParam == VK_MENU) ReleaseMouseLookCapture();
+            break;
         case WM_MOUSEMOVE:
+            if (g_mouseLookCaptured && (g_cfg.mouseLookEnabled || d3d9_bridge::IsPhotoMode()) && g_hRenderWnd && GetForegroundWindow() == hWnd) {
+                RECT rcRender{};
+                if (GetWindowRect(g_hRenderWnd, &rcRender)) {
+                    int cx = (rcRender.left + rcRender.right) / 2;
+                    int cy = (rcRender.top  + rcRender.bottom) / 2;
+                    POINT pt{};
+                    GetCursorPos(&pt);
+                    int dx = pt.x - cx;
+                    int dy = pt.y - cy;
+                    if (dx != 0 || dy != 0) {
+                        if (d3d9_bridge::IsPhotoMode()) {
+                            d3d9_bridge::AddPhotoModeMouseDelta(dx, dy);
+                        } else {
+                            xbe_loader::AddMouseLookDelta(dx, dy);
+                        }
+                        SetCursorPos(cx, cy);
+                    }
+                }
+                return 0;
+            }
             g_lastMouseMoveTick = GetTickCount();
             EnsureCursorVisible(true);
             break;
@@ -475,11 +585,42 @@ static LRESULT CALLBACK BuffyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             return 0;
         case WM_KEYDOWN: {
             if (wParam == VK_ESCAPE) {
+                if (d3d9_bridge::IsPhotoMode()) {
+                    d3d9_bridge::SetPhotoMode(false);
+                    ReleaseMouseLookCapture();
+                    xbe_loader::ShowStatusNotice("Photo Mode OFF");
+                    config_ui::RefreshBars();
+                    return 0;
+                }
+                if (g_mouseLookCaptured) {
+                    ReleaseMouseLookCapture();
+                    return 0;
+                }
                 DestroyWindow(hWnd);
                 return 0;
             }
+            if (wParam == VK_F10) {
+                bool next = !d3d9_bridge::IsPhotoMode();
+                d3d9_bridge::SetPhotoMode(next);
+                if (!next) ReleaseMouseLookCapture();
+                xbe_loader::ShowStatusNotice(next ? "Photo Mode ON (WASD+Q/E+Click Mouse, F12 Shot)" : "Photo Mode OFF");
+                config_ui::RefreshBars();
+                return 0;
+            }
+            if (wParam == VK_F12) {
+                d3d9_bridge::RequestScreenshot(g_screenshotsDirPath.c_str());
+                return 0;
+            }
             if (wParam == VK_F1) {
+                ReleaseMouseLookCapture();
                 config_ui::OpenConfigDialog(hWnd, &g_cfg, &g_uiCb, 0);
+                return 0;
+            }
+            if ((GetKeyState(VK_SHIFT) & 0x8000) && wParam >= '1' && wParam <= '5') {
+                g_cfg.activeSaveSlot = static_cast<int>(wParam - '0');
+                xbe_loader::SetActiveQuickSaveSlot(g_cfg.activeSaveSlot);
+                SaveSettingsIni();
+                config_ui::RefreshBars();
                 return 0;
             }
             if (wParam == VK_F11) {
@@ -566,6 +707,7 @@ extern "C" __declspec(dllexport) int __cdecl BuffyRuntimeMain() {
     g_settingsIniPath         = rootDir + "\\recomp\\settings.ini";
     g_hdTexDirPath            = rootDir + "\\recomp\\hd_textures";
     g_dumpTexDirPath          = rootDir + "\\recomp\\dump_textures";
+    g_screenshotsDirPath      = rootDir + "\\recomp\\screenshots";
 
     LoadSettingsIni();
     if (cmdLine) {
@@ -579,8 +721,24 @@ extern "C" __declspec(dllexport) int __cdecl BuffyRuntimeMain() {
     }
 
     g_uiCb.onApplyConfig      = &ApplyAllConfig;
-    g_uiCb.onQuickSave        = []() { xbe_loader::RequestQuickSave(); };
-    g_uiCb.onQuickLoad        = []() { xbe_loader::RequestQuickLoad(); };
+    g_uiCb.onQuickSave        = []() { xbe_loader::RequestQuickSave(0); };
+    g_uiCb.onQuickLoad        = []() { xbe_loader::RequestQuickLoad(0); };
+    g_uiCb.onQuickSaveSlot    = [](int slot) {
+        g_cfg.activeSaveSlot = slot;
+        xbe_loader::SetActiveQuickSaveSlot(slot);
+        SaveSettingsIni();
+        xbe_loader::RequestQuickSave(slot);
+    };
+    g_uiCb.onQuickLoadSlot    = [](int slot) {
+        g_cfg.activeSaveSlot = slot;
+        xbe_loader::SetActiveQuickSaveSlot(slot);
+        SaveSettingsIni();
+        xbe_loader::RequestQuickLoad(slot);
+    };
+    g_uiCb.onJumpToLevel      = [](const char* mapName) {
+        ReleaseMouseLookCapture();
+        xbe_loader::RequestJumpToLevel(mapName);
+    };
     g_uiCb.onToggleFullscreen = []() { if (g_hMainWnd) ToggleFullscreen(g_hMainWnd); };
     g_uiCb.onReloadHD         = []() { d3d9_bridge::ReloadHDTextures(); config_ui::RefreshBars(); };
     g_uiCb.onOpenHDFolder     = []() {
@@ -592,6 +750,14 @@ extern "C" __declspec(dllexport) int __cdecl BuffyRuntimeMain() {
         ShellExecuteA(g_hMainWnd, "open", g_dumpTexDirPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     };
     g_uiCb.onFrameTrace       = []() { d3d9_bridge::RequestFrameTrace(); };
+    g_uiCb.onTogglePhotoMode  = []() {
+        bool next = !d3d9_bridge::IsPhotoMode();
+        d3d9_bridge::SetPhotoMode(next);
+        if (!next) ReleaseMouseLookCapture();
+        xbe_loader::ShowStatusNotice(next ? "Photo Mode ON (WASD+Q/E+Click Mouse, F12 Shot)" : "Photo Mode OFF");
+        config_ui::RefreshBars();
+    };
+    g_uiCb.onTakeScreenshot   = []() { d3d9_bridge::RequestScreenshot(g_screenshotsDirPath.c_str()); };
     g_uiCb.onExitApp          = []() { if (g_hMainWnd) DestroyWindow(g_hMainWnd); };
 
     d3d9_bridge::SetTexturePackDirs(g_hdTexDirPath.c_str(), g_dumpTexDirPath.c_str());

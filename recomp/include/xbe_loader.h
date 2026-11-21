@@ -19,10 +19,21 @@ bool LoadAndBridgeDefaultXbe(const char* xbePath);
 // Execute Xbox CRT initialization (__rtinit, __cinit for 470 C++ constructors) and jump into _main (0x00064F90)
 int ExecuteXboxMain();
 
-// Quick Save / Quick Load / Auto-Resume into exact saved gameplay spot
-void RequestQuickSave();
-void RequestQuickLoad();
+// Quick Save / Quick Load (5 slots: 1..5) / Auto-Resume into exact saved gameplay spot
+void RequestQuickSave(int slot = 0); // 0 = active slot
+void RequestQuickLoad(int slot = 0); // 0 = active slot
+void SetActiveQuickSaveSlot(int slot);
+int  GetActiveQuickSaveSlot();
+bool HasQuickSaveInSlot(int slot);
 void SetAutoResumeQuickSave(bool enabled);
+void SetSubtitlesEnabled(bool enabled);
+bool IsSubtitlesEnabled();
+void SetAutoPauseUnfocused(bool enabled);
+void SetCheats(bool infHealth, bool infPower, bool infAmmoDurability, bool oneHitDust);
+void ShowStatusNotice(const char* msg);
+
+// Chapter / Arena Launcher (relaunch straight into any mission, hub, or arena via LAUNCH_DATA)
+void RequestJumpToLevel(const char* mapName);
 
 // Buffy Costume Override (0=Level Default, 1=Slayer, 2=Cheerleader, 3=The Bronze, 4=Workout)
 void     SetBuffyCostume(uint32_t costumeId);
@@ -38,11 +49,15 @@ uint32_t GetMeasuredFps();
 void     SetFovOffsetDeg(int offsetDeg);
 int      GetFovOffsetDeg();
 
-// Controller settings & live status for Configuration UI / Bottom Status Bar
+// Controller, Mouse-Look & Custom Keybind settings
 void     SetRumbleEnabled(bool enabled);
 bool     IsRumbleEnabled();
 void     SetDeadzonePercent(int percent);
 int      GetDeadzonePercent();
+void     SetCameraControlSettings(bool mouseLook, int sensitivityPercent, bool invertX, bool invertY);
+void     SetMouseLookCaptured(bool captured);
+void     AddMouseLookDelta(int dx, int dy);
+void     SetKeybinds(const int vkCodes[10]);
 bool     IsGamepadConnected();
 uint32_t GetActivePadSlot();
 const char* GetQuickStatusText();
