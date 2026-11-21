@@ -56,6 +56,7 @@ static void LoadSettingsIni() {
     g_cfg.autoResumeQuickSave = GetPrivateProfileIntA("Game",     "AutoResumeQuickSave", 0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.hideMouseInactivity = GetPrivateProfileIntA("Game",     "HideMouseInactivity", 1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.showStatusBar       = GetPrivateProfileIntA("Game",     "ShowStatusBar",       1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.buffyCostume        = GetPrivateProfileIntA("Game",     "BuffyCostume",        0,         g_settingsIniPath.c_str());
     g_cfg.masterVolume        = GetPrivateProfileIntA("Audio",    "MasterVolume",        100,       g_settingsIniPath.c_str());
     g_cfg.muteAudio           = GetPrivateProfileIntA("Audio",    "MuteAudio",           0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.muteInBackground    = GetPrivateProfileIntA("Audio",    "MuteInBackground",    0,         g_settingsIniPath.c_str()) != 0;
@@ -69,6 +70,7 @@ static void LoadSettingsIni() {
     if (g_cfg.targetFps != 0 && g_cfg.targetFps != 30 && g_cfg.targetFps != 60 && g_cfg.targetFps != 120 && g_cfg.targetFps != 165) g_cfg.targetFps = 60;
     if (g_cfg.masterVolume < 0 || g_cfg.masterVolume > 100) g_cfg.masterVolume = 100;
     if (g_cfg.deadzonePercent < 0 || g_cfg.deadzonePercent > 40) g_cfg.deadzonePercent = 15;
+    if (g_cfg.buffyCostume > 4) g_cfg.buffyCostume = 0;
 }
 
 static void SaveSettingsIni() {
@@ -88,6 +90,7 @@ static void SaveSettingsIni() {
     writeU("Game",     "AutoResumeQuickSave", g_cfg.autoResumeQuickSave ? 1 : 0);
     writeU("Game",     "HideMouseInactivity", g_cfg.hideMouseInactivity ? 1 : 0);
     writeU("Game",     "ShowStatusBar",       g_cfg.showStatusBar ? 1 : 0);
+    writeU("Game",     "BuffyCostume",        static_cast<int>(g_cfg.buffyCostume));
     writeU("Audio",    "MasterVolume",        g_cfg.masterVolume);
     writeU("Audio",    "MuteAudio",           g_cfg.muteAudio ? 1 : 0);
     writeU("Audio",    "MuteInBackground",    g_cfg.muteInBackground ? 1 : 0);
@@ -98,12 +101,14 @@ static void SaveSettingsIni() {
 static void LayoutMainWindow(HWND hWnd);
 
 static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
+    uint32_t prevCostume = xbe_loader::GetBuffyCostume();
     g_cfg = cfg;
     d3d9_bridge::RequestGraphicsSettings(g_cfg.resScale, g_cfg.msaa, g_cfg.aniso, g_cfg.aspectMode);
     d3d9_bridge::SetFogEnabled(g_cfg.atmosphericFog);
     d3d9_bridge::SetHDTexturesEnabled(g_cfg.enableHDTextures);
     d3d9_bridge::SetTextureDumpEnabled(g_cfg.dumpTextures);
     xbe_loader::SetAutoResumeQuickSave(g_cfg.autoResumeQuickSave);
+    xbe_loader::SetBuffyCostume(g_cfg.buffyCostume);
     xbe_loader::SetTargetFps(g_cfg.targetFps);
     xbe_loader::SetRumbleEnabled(g_cfg.rumbleEnabled);
     xbe_loader::SetDeadzonePercent(g_cfg.deadzonePercent);
@@ -111,6 +116,9 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     dsound_bridge::SetMuted(g_cfg.muteAudio);
     dsound_bridge::SetMuteInBackground(g_cfg.muteInBackground);
     SaveSettingsIni();
+    if (g_hMainWnd && IsWindow(g_hMainWnd) && prevCostume != g_cfg.buffyCostume) {
+        xbe_loader::RequestCostumeReloadInPlace();
+    }
     if (relayout && g_hMainWnd && IsWindow(g_hMainWnd)) {
         LayoutMainWindow(g_hMainWnd);
         InvalidateRect(g_hMainWnd, nullptr, TRUE);

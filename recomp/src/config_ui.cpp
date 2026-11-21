@@ -635,6 +635,13 @@ static void RebuildConfigControls(int w, int h) {
     };
 
     if (g_cfgTab == 0) { // General
+        const char* cosStr = (g_cfg->buffyCostume == 1) ? "Slayer (Blue Top)"
+                           : ((g_cfg->buffyCostume == 2) ? "Cheerleader"
+                           : ((g_cfg->buffyCostume == 3) ? "The Bronze (Club)"
+                           : ((g_cfg->buffyCostume == 4) ? "Workout / Sport" : "Level Default")));
+        addDropdown(107, "Buffy Costume:", cosStr);
+        addLabel("  (Automatically reloads your current spot with the new outfit)");
+        y += 4;
         addToggle(101, "Auto-Resume Quick Save on Launch", g_cfg->autoResumeQuickSave);
         addToggle(102, "Hide Mouse Cursor on Inactivity",  g_cfg->hideMouseInactivity);
         addToggle(103, "Show Bottom Status Bar",           g_cfg->showStatusBar);
@@ -709,7 +716,13 @@ static void HandleDropdownClick(HWND hWnd, const UiCtrl& c) {
     POINT pt{ c.hitRc.left, c.hitRc.bottom };
     ClientToScreen(hWnd, &pt);
     HMENU hPop = CreatePopupMenu();
-    if (c.id == 201) {
+    if (c.id == 107) {
+        AppendMenuA(hPop, MF_STRING, 1, "Level Default");
+        AppendMenuA(hPop, MF_STRING, 2, "Slayer (Blue Top)");
+        AppendMenuA(hPop, MF_STRING, 3, "Cheerleader");
+        AppendMenuA(hPop, MF_STRING, 4, "The Bronze (Club)");
+        AppendMenuA(hPop, MF_STRING, 5, "Workout / Sport");
+    } else if (c.id == 201) {
         AppendMenuA(hPop, MF_STRING, 1, "4:3 Classic");
         AppendMenuA(hPop, MF_STRING, 2, "16:9 Widescreen");
         AppendMenuA(hPop, MF_STRING, 3, "21:9 Ultrawide (3440x1440)");
@@ -739,7 +752,8 @@ static void HandleDropdownClick(HWND hWnd, const UiCtrl& c) {
     if (sel == 0) return;
 
     bool relayout = false;
-    if (c.id == 201)      { g_cfg->aspectMode = sel - 1; relayout = true; }
+    if (c.id == 107)      { g_cfg->buffyCostume = sel - 1; }
+    else if (c.id == 201) { g_cfg->aspectMode = sel - 1; relayout = true; }
     else if (c.id == 202) { g_cfg->resScale   = sel; }
     else if (c.id == 203) { g_cfg->targetFps  = (sel == 999) ? 0u : sel; }
     else if (c.id == 204) { g_cfg->msaa       = (sel == 1) ? 0u : sel; }

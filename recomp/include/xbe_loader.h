@@ -24,6 +24,11 @@ void RequestQuickSave();
 void RequestQuickLoad();
 void SetAutoResumeQuickSave(bool enabled);
 
+// Buffy Costume Override (0=Level Default, 1=Slayer, 2=Cheerleader, 3=The Bronze, 4=Workout)
+void     SetBuffyCostume(uint32_t costumeId);
+uint32_t GetBuffyCostume();
+void     RequestCostumeReloadInPlace();
+
 // High-precision frame pacer (0 = uncapped, 30 / 60 / 120 / 165 FPS) with exact 1.0x QPC real-time speed
 void     SetTargetFps(uint32_t fps);
 uint32_t GetTargetFps();

@@ -4,6 +4,7 @@
 #include "dsound_bridge.h"
 #include <mmsystem.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -355,6 +356,293 @@ static DWORD __stdcall Detour_GetLastError() { return GetLastError(); }
 static void  __stdcall Detour_SetLastError(DWORD err) { SetLastError(err); }
 static DWORD __stdcall Detour_GetCurrentThreadId() { return GetCurrentThreadId(); }
 
+// ============================================================================
+// Buffy Costume Extractor & Runtime .pak Swapper
+// (0=Level Default, 1=Slayer, 2=Cheerleader, 3=The Bronze, 4=Workout/Sport)
+// Extracts costumes locally from user's extracted\pak\ into recomp\cache\costumes\
+// ============================================================================
+static uint32_t g_buffyCostume = 0;
+
+struct CostumeAssets {
+    std::vector<uint8_t> mesh;      // raw .msh payload
+    std::vector<uint8_t> faceEntry; // full .pak entry (header + name + sub + payload)
+    std::vector<uint8_t> bodyEntry; // full .pak entry
+    std::vector<uint8_t> legEntry;  // full .pak entry
+    std::vector<uint8_t> ban;       // raw .ban payload
+    bool valid() const {
+        return !mesh.empty() && !faceEntry.empty() && !bodyEntry.empty() && !legEntry.empty() && !ban.empty();
+    }
+};
+
+static bool ReadWholeFile(const char* path, std::vector<uint8_t>& out) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long sz = std::ftell(f);
+    if (sz <= 0) { std::fclose(f); return false; }
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(static_cast<size_t>(sz));
+    bool ok = (std::fread(out.data(), 1, static_cast<size_t>(sz), f) == static_cast<size_t>(sz));
+    std::fclose(f);
+    return ok;
+}
+
+static bool WriteWholeFile(const char* path, const void* data, size_t len) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    bool ok = (len == 0 || std::fwrite(data, 1, len, f) == len);
+    std::fclose(f);
+    return ok;
+}
+
+static void EnsureDirTree(const char* dirPath) {
+    char buf[512]{};
+    std::strncpy(buf, dirPath, sizeof(buf) - 1);
+    for (char* p = buf; *p; ++p) {
+        if (*p == '\\' || *p == '/') {
+            char saved = *p;
+            *p = '\0';
+            if (p != buf && *(p - 1) != ':') CreateDirectoryA(buf, nullptr);
+            *p = saved;
+        }
+    }
+    CreateDirectoryA(buf, nullptr);
+}
+
+static bool StrEndsWithI(const std::string& s, const char* suf) {
+    size_t sl = std::strlen(suf);
+    return s.size() >= sl && _stricmp(s.c_str() + s.size() - sl, suf) == 0;
+}
+
+static bool StrStartsWithI(const std::string& s, const char* pre) {
+    size_t pl = std::strlen(pre);
+    return s.size() >= pl && _strnicmp(s.c_str(), pre, pl) == 0;
+}
+
+static size_t FindFirstPakEntry(const uint8_t* d, size_t len) {
+    size_t scanMax = (len < 0x200000u) ? len : 0x200000u;
+    for (size_t off = 0; off + 32 <= scanMax; ++off) {
+        uint32_t typ, fo, tot, pay, flg, nlen;
+        std::memcpy(&typ,  d + off + 0,  4);
+        if (typ != 1u) continue;
+        std::memcpy(&fo,   d + off + 4,  4);
+        if (fo != static_cast<uint32_t>(off)) continue;
+        std::memcpy(&tot,  d + off + 8,  4);
+        std::memcpy(&pay,  d + off + 12, 4);
+        std::memcpy(&flg,  d + off + 16, 4);
+        std::memcpy(&nlen, d + off + 20, 4);
+        if (nlen < 4u || nlen > 128u || tot <= 24u + nlen + 8u || off + tot + 24u > len) continue;
+        bool asciiOk = true;
+        for (uint32_t k = 0; k < nlen; ++k) {
+            uint8_t c = d[off + 24u + k];
+            if (c < 32 || c > 126) { asciiOk = false; break; }
+        }
+        if (!asciiOk) continue;
+        // Verify the immediately following entry also chains cleanly
+        uint32_t typ2 = 0, fo2 = 0;
+        std::memcpy(&typ2, d + off + tot + 0, 4);
+        std::memcpy(&fo2,  d + off + tot + 4, 4);
+        if (typ2 == 1u && fo2 == static_cast<uint32_t>(off + tot)) {
+            return off;
+        }
+    }
+    return static_cast<size_t>(-1);
+}
+
+static bool LoadOrExtractCostume(uint32_t costumeId, CostumeAssets& out) {
+    static const char* kTags[5] = { "", "slayer", "cheer", "bronze", "workout" };
+    static const char* kSrcPaks[5] = {
+        "",
+        "D:\\pak\\res_m00_spanishmission_1.pak",
+        "D:\\pak\\res_m01_highschool_1.pak",
+        "D:\\pak\\res_m02_bronze_0.pak",
+        "D:\\pak\\res_m06_mansion_1.pak"
+    };
+    if (costumeId < 1 || costumeId > 4) return false;
+
+    char cacheDir[512]{};
+    char xboxDir[128]{};
+    std::snprintf(xboxDir, sizeof(xboxDir), "Z:\\costumes\\%s", kTags[costumeId]);
+    xboxkrnl::TranslateXboxPath(xboxDir, cacheDir, sizeof(cacheDir));
+    EnsureDirTree(cacheDir);
+
+    std::string pMesh = std::string(cacheDir) + "\\mesh.bin";
+    std::string pFace = std::string(cacheDir) + "\\face.entry";
+    std::string pBody = std::string(cacheDir) + "\\body.entry";
+    std::string pLeg  = std::string(cacheDir) + "\\leg.entry";
+    std::string pBan  = std::string(cacheDir) + "\\ban.bin";
+
+    if (ReadWholeFile(pMesh.c_str(), out.mesh) &&
+        ReadWholeFile(pFace.c_str(), out.faceEntry) &&
+        ReadWholeFile(pBody.c_str(), out.bodyEntry) &&
+        ReadWholeFile(pLeg.c_str(),  out.legEntry) &&
+        ReadWholeFile(pBan.c_str(),  out.ban)) {
+        return out.valid();
+    }
+
+    char srcPakWin[512]{};
+    xboxkrnl::TranslateXboxPath(kSrcPaks[costumeId], srcPakWin, sizeof(srcPakWin));
+    std::vector<uint8_t> pak;
+    if (!ReadWholeFile(srcPakWin, pak)) {
+        LogPrintf("[Costume] Failed to open source pak '%s' for '%s'\n", srcPakWin, kTags[costumeId]);
+        return false;
+    }
+    size_t cur = FindFirstPakEntry(pak.data(), pak.size());
+    if (cur == static_cast<size_t>(-1)) return false;
+
+    while (cur + 24u <= pak.size()) {
+        uint32_t typ, fo, tot, pay, flg, nlen;
+        std::memcpy(&typ,  pak.data() + cur + 0,  4);
+        std::memcpy(&fo,   pak.data() + cur + 4,  4);
+        std::memcpy(&tot,  pak.data() + cur + 8,  4);
+        std::memcpy(&pay,  pak.data() + cur + 12, 4);
+        std::memcpy(&flg,  pak.data() + cur + 16, 4);
+        std::memcpy(&nlen, pak.data() + cur + 20, 4);
+        if (typ != 1u || fo != static_cast<uint32_t>(cur) || tot == 0 || cur + tot > pak.size()) break;
+        if (24u + nlen + 8u <= tot) {
+            std::string name(reinterpret_cast<const char*>(pak.data() + cur + 24u), nlen);
+            uint32_t snlen = 0;
+            std::memcpy(&snlen, pak.data() + cur + 24u + nlen, 4);
+            size_t hdrBytes = 24u + nlen + 4u + snlen + 4u;
+            if (hdrBytes <= tot && StrStartsWithI(name, "meshes\\chars\\slayer\\buffy")) {
+                std::string sub(reinterpret_cast<const char*>(pak.data() + cur + 24u + nlen + 4u), snlen);
+                if (StrEndsWithI(name, ".msh") && _stricmp(sub.c_str(), "base") == 0 && out.mesh.empty()) {
+                    out.mesh.assign(pak.data() + cur + hdrBytes, pak.data() + cur + tot);
+                } else if (StrEndsWithI(name, ".mtx")) {
+                    if (StrEndsWithI(sub, "_face") && out.faceEntry.empty()) {
+                        out.faceEntry.assign(pak.data() + cur, pak.data() + cur + tot);
+                    } else if (StrEndsWithI(sub, "_body") && out.bodyEntry.empty()) {
+                        out.bodyEntry.assign(pak.data() + cur, pak.data() + cur + tot);
+                    } else if (StrEndsWithI(sub, "_leg") && out.legEntry.empty()) {
+                        out.legEntry.assign(pak.data() + cur, pak.data() + cur + tot);
+                    }
+                } else if (StrEndsWithI(name, ".ban") && out.ban.empty()) {
+                    out.ban.assign(pak.data() + cur + hdrBytes, pak.data() + cur + tot);
+                }
+            }
+        }
+        cur += tot;
+    }
+
+    if (!out.valid()) {
+        LogPrintf("[Costume] Incomplete extraction for '%s' (msh=%u face=%u body=%u leg=%u ban=%u)\n",
+                  kTags[costumeId],
+                  static_cast<unsigned>(out.mesh.size()), static_cast<unsigned>(out.faceEntry.size()),
+                  static_cast<unsigned>(out.bodyEntry.size()), static_cast<unsigned>(out.legEntry.size()),
+                  static_cast<unsigned>(out.ban.size()));
+        return false;
+    }
+    WriteWholeFile(pMesh.c_str(), out.mesh.data(), out.mesh.size());
+    WriteWholeFile(pFace.c_str(), out.faceEntry.data(), out.faceEntry.size());
+    WriteWholeFile(pBody.c_str(), out.bodyEntry.data(), out.bodyEntry.size());
+    WriteWholeFile(pLeg.c_str(),  out.legEntry.data(),  out.legEntry.size());
+    WriteWholeFile(pBan.c_str(),  out.ban.data(),       out.ban.size());
+    LogPrintf("[Costume] Extracted '%s' to %s (msh=%u B, ban=%u B)\n",
+              kTags[costumeId], cacheDir, static_cast<unsigned>(out.mesh.size()), static_cast<unsigned>(out.ban.size()));
+    return true;
+}
+
+static bool BuildCostumePatchedPak(const char* srcPakWinPath, uint32_t costumeId, char* outPakWinPath, size_t outMax) {
+    char cosRoot[512]{};
+    xboxkrnl::TranslateXboxPath("Z:\\costumes", cosRoot, sizeof(cosRoot));
+    EnsureDirTree(cosRoot);
+
+    std::string activePak = std::string(cosRoot) + "\\active_costume.pak";
+    std::string activeTag = std::string(cosRoot) + "\\active_costume.tag";
+    std::string wantTag   = std::string(srcPakWinPath) + "|" + std::to_string(costumeId) + "|v2";
+
+    // Fast path: reuse already-built patched pak if same level & costume
+    std::vector<uint8_t> existingTag;
+    if (ReadWholeFile(activeTag.c_str(), existingTag) &&
+        existingTag.size() == wantTag.size() &&
+        std::memcmp(existingTag.data(), wantTag.data(), wantTag.size()) == 0 &&
+        GetFileAttributesA(activePak.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::strncpy(outPakWinPath, activePak.c_str(), outMax - 1);
+        outPakWinPath[outMax - 1] = '\0';
+        return true;
+    }
+
+    CostumeAssets cd{};
+    if (!LoadOrExtractCostume(costumeId, cd)) return false;
+
+    DWORD t0 = GetTickCount();
+    std::vector<uint8_t> src;
+    if (!ReadWholeFile(srcPakWinPath, src)) return false;
+    size_t firstEntry = FindFirstPakEntry(src.data(), src.size());
+    if (firstEntry == static_cast<size_t>(-1)) return false;
+
+    std::vector<uint8_t> dst;
+    dst.reserve(src.size() + 65536u);
+    dst.insert(dst.end(), src.data(), src.data() + firstEntry);
+
+    size_t cur = firstEntry;
+    int replaced = 0;
+    while (cur + 24u <= src.size()) {
+        uint32_t typ, fo, tot, pay, flg, nlen;
+        std::memcpy(&typ,  src.data() + cur + 0,  4);
+        std::memcpy(&fo,   src.data() + cur + 4,  4);
+        std::memcpy(&tot,  src.data() + cur + 8,  4);
+        std::memcpy(&pay,  src.data() + cur + 12, 4);
+        std::memcpy(&flg,  src.data() + cur + 16, 4);
+        std::memcpy(&nlen, src.data() + cur + 20, 4);
+        if (typ != 1u || fo != static_cast<uint32_t>(cur) || tot == 0 || cur + tot > src.size()) break;
+
+        uint32_t newOff = static_cast<uint32_t>(dst.size());
+        bool swapped = false;
+        if (24u + nlen + 8u <= tot) {
+            std::string name(reinterpret_cast<const char*>(src.data() + cur + 24u), nlen);
+            uint32_t snlen = 0;
+            std::memcpy(&snlen, src.data() + cur + 24u + nlen, 4);
+            size_t hdrBytes = 24u + nlen + 4u + snlen + 4u;
+            if (hdrBytes <= tot && StrStartsWithI(name, "meshes\\chars\\slayer\\buffy")) {
+                std::string sub(reinterpret_cast<const char*>(src.data() + cur + 24u + nlen + 4u), snlen);
+                if (StrEndsWithI(name, ".msh") && _stricmp(sub.c_str(), "base") == 0) {
+                    dst.insert(dst.end(), src.data() + cur, src.data() + cur + hdrBytes);
+                    dst.insert(dst.end(), cd.mesh.begin(), cd.mesh.end());
+                    uint32_t newPay = static_cast<uint32_t>(cd.mesh.size());
+                    uint32_t newTot = static_cast<uint32_t>(hdrBytes) + newPay;
+                    std::memcpy(dst.data() + newOff + 4,  &newOff, 4);
+                    std::memcpy(dst.data() + newOff + 8,  &newTot, 4);
+                    std::memcpy(dst.data() + newOff + 12, &newPay, 4);
+                    swapped = true;
+                    ++replaced;
+                } else if (StrEndsWithI(name, ".mtx")) {
+                    const std::vector<uint8_t>* rep = nullptr;
+                    if (StrEndsWithI(sub, "_face")) rep = &cd.faceEntry;
+                    else if (StrEndsWithI(sub, "_body")) rep = &cd.bodyEntry;
+                    else if (StrEndsWithI(sub, "_leg"))  rep = &cd.legEntry;
+                    if (rep) {
+                        dst.insert(dst.end(), rep->begin(), rep->end());
+                        std::memcpy(dst.data() + newOff + 4, &newOff, 4);
+                        swapped = true;
+                        ++replaced;
+                    }
+                }
+                // Note: keep the level's own .ban intact! Each level's .ban contains level-specific
+                // animation bindings (cutscenes, props, etc.) that share the same Slayer skeleton.
+            }
+        }
+        if (!swapped) {
+            dst.insert(dst.end(), src.data() + cur, src.data() + cur + tot);
+            std::memcpy(dst.data() + newOff + 4, &newOff, 4);
+        }
+        cur += tot;
+    }
+
+    // Copy 32-byte zero terminator / trailer verbatim
+    if (cur < src.size()) {
+        dst.insert(dst.end(), src.data() + cur, src.data() + src.size());
+    }
+    if (replaced == 0) return false;
+    if (!WriteWholeFile(activePak.c_str(), dst.data(), dst.size())) return false;
+    WriteWholeFile(activeTag.c_str(), wantTag.data(), wantTag.size());
+    LogPrintf("[Costume] Patched '%s' -> costume=%u (%d entries swapped in %lu ms)\n",
+              srcPakWinPath, costumeId, replaced, GetTickCount() - t0);
+    std::strncpy(outPakWinPath, activePak.c_str(), outMax - 1);
+    outPakWinPath[outMax - 1] = '\0';
+    return true;
+}
+
 static HANDLE __stdcall Detour_CreateFileA(
     const char* lpFileName,
     DWORD dwDesiredAccess,
@@ -366,6 +654,19 @@ static HANDLE __stdcall Detour_CreateFileA(
 ) {
     char winPath[512]{};
     xboxkrnl::TranslateXboxPath(lpFileName, winPath, sizeof(winPath));
+    // Optional Buffy costume override on gameplay level .pak opens
+    if (g_buffyCostume >= 1 && g_buffyCostume <= 4 && dwCreationDisposition == OPEN_EXISTING && winPath[0]) {
+        std::string wpLow(winPath);
+        for (char& ch : wpLow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (StrEndsWithI(wpLow, ".pak") && !StrEndsWithI(wpLow, "res_null.pak") &&
+            wpLow.find("\\pak\\res_") != std::string::npos) {
+            char patchedPak[512]{};
+            if (BuildCostumePatchedPak(winPath, g_buffyCostume, patchedPak, sizeof(patchedPak))) {
+                std::strncpy(winPath, patchedPak, sizeof(winPath) - 1);
+                winPath[sizeof(winPath) - 1] = '\0';
+            }
+        }
+    }
     // Strip Xbox-specific file flags that Win32 doesn't use
     DWORD cleanFlags = dwFlagsAndAttributes & ~(0x08000000u);
     if (cleanFlags == 0) cleanFlags = FILE_ATTRIBUTE_NORMAL;
@@ -527,8 +828,9 @@ static void __stdcall Detour_OutputDebugStringA(const char* lpOutputString) {
 static uint8_t  g_lastLaunchData[3072]{};
 static bool     g_hasLastLaunchData  = false;
 static bool     g_autoResumeQuick    = false;
-static volatile LONG g_quickSaveReq  = 0;
-static volatile LONG g_quickLoadReq  = 0;
+static volatile LONG g_quickSaveReq     = 0;
+static volatile LONG g_quickLoadReq     = 0;
+static volatile LONG g_costumeReloadReq = 0;
 
 struct QuickSaveState {
     uint32_t magic;            // 'BFQS' = 0x53514642
@@ -1551,6 +1853,28 @@ static void __stdcall Detour_D3DDevice_Swap(uint32_t Flags) {
         }
     }
 
+    // Handle live Buffy Costume switch: save CURRENT level & exact spot, then reload it in-place with the new outfit
+    if (InterlockedExchange(&g_costumeReloadReq, 0) != 0) {
+        void* player = GetLivePlayerObject();
+        if (player && g_hasLastLaunchData) {
+            QuickSaveState qs{};
+            qs.magic         = 0x53514642u;
+            qs.version       = 1u;
+            qs.hasLaunchData = 1u;
+            std::memcpy(qs.launchData, g_lastLaunchData, sizeof(qs.launchData));
+            qs.hasPlayerMtx  = 1u;
+            std::memcpy(qs.playerMtx, static_cast<const uint8_t*>(player) + 0x21C, sizeof(qs.playerMtx));
+            WriteQuickSaveState(qs);
+            char qlFlagPath[512]{};
+            xboxkrnl::TranslateXboxPath("T:\\quickload_restore.flag", qlFlagPath, sizeof(qlFlagPath));
+            FILE* ff = std::fopen(qlFlagPath, "wb");
+            if (ff) { std::fputc('1', ff); std::fclose(ff); }
+            LogPrintf("[Costume] Reloading current level in-place at (%.2f, %.2f, %.2f) with costume=%u...\n",
+                      qs.playerMtx[9], qs.playerMtx[10], qs.playerMtx[11], g_buffyCostume);
+            Detour_XLaunchNewImageA("d:\\default.xbe", qs.launchData);
+        }
+    }
+
     if (g_frameCount == 1 || (g_frameCount % 60) == 0) {
         LogPrintf("[D3D8] Frame %u presented (DrawCalls=%u, ClearColor=0x%06X, FPS=%u)\n",
                   g_frameCount, g_drawCalls, g_clearColor, g_measuredFps);
@@ -2197,6 +2521,18 @@ void RequestQuickLoad() {
 
 void SetAutoResumeQuickSave(bool enabled) {
     g_autoResumeQuick = enabled;
+}
+
+void SetBuffyCostume(uint32_t costumeId) {
+    g_buffyCostume = (costumeId <= 4) ? costumeId : 0;
+}
+
+uint32_t GetBuffyCostume() {
+    return g_buffyCostume;
+}
+
+void RequestCostumeReloadInPlace() {
+    InterlockedExchange(&g_costumeReloadReq, 1);
 }
 
 void SetTargetFps(uint32_t fps) {

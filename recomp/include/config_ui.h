@@ -10,6 +10,7 @@ struct AppConfig {
     bool     autoResumeQuickSave = false;
     bool     hideMouseInactivity = true;
     bool     showStatusBar       = true;
+    uint32_t buffyCostume        = 0;    // 0=Level Default, 1=Slayer, 2=Cheerleader, 3=The Bronze, 4=Workout
     // Graphics
     uint32_t aspectMode          = 2;    // 0=4:3, 1=16:9, 2=21:9
     uint32_t resScale            = 4;    // 1..4
