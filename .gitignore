@@ -20,6 +20,7 @@ recomp/cache/
 recomp/saves/
 recomp/dump_textures/
 recomp/hd_textures/
+recomp/screenshots/
 recomp/settings.ini
 
 # Logs, Python bytecode & editor/IDE files

@@ -31,9 +31,15 @@ void SetFogEnabled(bool enabled);
 bool IsFogEnabled();
 void SetBloomEnabled(bool enabled);
 bool IsBloomEnabled();
+void SetSharpnessPercent(int sharpnessPercent);
+void SetPostEffects(bool vignetteEnabled, bool scanlinesEnabled);
 void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPercent);
 void SetMenuPillarbox(bool enabled);
 void RequestFrameTrace();
+void RequestScreenshot(const char* screenshotsDir);
+void SetPhotoMode(bool enabled);
+bool IsPhotoMode();
+void AddPhotoModeMouseDelta(int dx, int dy);
 
 // Core Xbox D3D8 -> Win32 D3D9 bridged operations
 void Clear(uint32_t count, const void* pRects, uint32_t flags, uint32_t color, float z, uint32_t stencil);
