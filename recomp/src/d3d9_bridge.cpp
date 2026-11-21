@@ -62,6 +62,7 @@ static std::vector<float> g_volVertScratch;
 static std::vector<uint8_t> g_customVsScratch;
 
 struct ParsedVsDecl {
+    int32_t  shaderId   = -1;
     int8_t   posStream  = -1; uint16_t posOff  = 0;
     int8_t   diffStream = -1; uint16_t diffOff = 0;
     int8_t   uv0Stream  = -1; uint16_t uv0Off  = 0; uint8_t uv0Floats = 0;
@@ -1326,9 +1327,10 @@ void SetVertexShader(uint32_t handle) {
     }
 }
 
-void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl) {
+void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl, int32_t shaderId) {
     if (!handle || !pDecl) return;
     ParsedVsDecl d{};
+    d.shaderId = shaderId;
     int8_t curStream = 0;
     uint16_t curOff = 0;
     char rawToks[256]{};
@@ -1362,15 +1364,18 @@ void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl) {
                     d.posStream = curStream; d.posOff = curOff;
                 } else if (reg == 3u) {
                     d.diffStream = curStream; d.diffOff = curOff;
+                } else if (reg == 11u && dt == 0x40u) {
+                    // Slate Engine dynamic/baked per-vertex diffuse lighting stream (v11 overrides packed normal v1!)
+                    d.diffStream = curStream; d.diffOff = curOff;
                 } else if (reg == 9u || (reg == 7u && d.uv0Stream < 0 && et == 2u)) {
                     d.uv0Stream = curStream; d.uv0Off = curOff; d.uv0Floats = static_cast<uint8_t>(cnt ? cnt : 2u);
                 } else if (reg == 10u || (reg == 8u && d.uv1Stream < 0 && et == 2u)) {
                     d.uv1Stream = curStream; d.uv1Off = curOff; d.uv1Floats = static_cast<uint8_t>(cnt ? cnt : 2u);
                 } else if (dt == 0x40u && d.diffStream < 0) {
-                    // Programmable VS diffuse color (e.g. StaticWind v2 or Stream 1 dynamic lighting)
+                    // Fallback programmable VS diffuse color (e.g. StaticWind v2)
                     d.diffStream = curStream; d.diffOff = curOff;
                 } else if (dt == 0x22u && d.uv0Stream < 0) {
-                    // Programmable VS TEXCOORD0 (e.g. StaticWind v1 or StaticMesh v2)
+                    // Programmable VS TEXCOORD0 (e.g. StaticWind v1 or StaticOmni0 v2)
                     d.uv0Stream = curStream; d.uv0Off = curOff; d.uv0Floats = 2u;
                 } else if (dt == 0x22u && d.uv1Stream < 0) {
                     // Programmable VS TEXCOORD1
@@ -1381,8 +1386,8 @@ void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl) {
         }
     }
     g_vsDecls[handle] = d;
-    LogPrintf("[D3D9] VSDecl 0x%08X: pos(s%d+%u) diff(s%d+%u) uv0(s%d+%u,%uF) uv1(s%d+%u,%uF) | %s\n",
-              handle, d.posStream, d.posOff, d.diffStream, d.diffOff,
+    LogPrintf("[D3D9] VSDecl 0x%08X (id=%d): pos(s%d+%u) diff(s%d+%u) uv0(s%d+%u,%uF) uv1(s%d+%u,%uF) | %s\n",
+              handle, shaderId, d.posStream, d.posOff, d.diffStream, d.diffOff,
               d.uv0Stream, d.uv0Off, d.uv0Floats, d.uv1Stream, d.uv1Off, d.uv1Floats, rawToks);
 }
 
@@ -2085,8 +2090,34 @@ void DrawIndexedVertices(uint32_t xboxPrimType, uint32_t vertexCount, const void
         D3DPRIMITIVETYPE pt = D3DPT_TRIANGLELIST;
         uint32_t primCount = 0;
         if (MapXboxPrimitive(xboxPrimType, vertexCount, pt, primCount) && primCount > 0) {
+            // For programmable Xbox vertex shaders (shaderId >= 0), Slate Engine uploads the
+            // object's 3x4 World matrix into CD3DMatrixState::m_dRenderRegisters[6..8] (0x00834BC0)
+            // instead of calling SetTransform(D3DTS_WORLD). Apply it cleanly for this draw!
+            bool appliedConstWorld = false;
+            D3DMATRIX savedWorld{};
+            if (d.shaderId >= 0) {
+                const float* c6 = reinterpret_cast<const float*>(0x00834BC0);
+                const float* c7 = reinterpret_cast<const float*>(0x00834BD0);
+                const float* c8 = reinterpret_cast<const float*>(0x00834BE0);
+                if (c6[0] != 0.0f || c6[1] != 0.0f || c6[2] != 0.0f ||
+                    c7[0] != 0.0f || c7[1] != 0.0f || c7[2] != 0.0f) {
+                    g_dev->GetTransform(D3DTS_WORLD, &savedWorld);
+                    D3DMATRIX w{};
+                    w._11 = c6[0]; w._12 = c7[0]; w._13 = c8[0]; w._14 = 0.0f;
+                    w._21 = c6[1]; w._22 = c7[1]; w._23 = c8[1]; w._24 = 0.0f;
+                    w._31 = c6[2]; w._32 = c7[2]; w._33 = c8[2]; w._34 = 0.0f;
+                    w._41 = c6[3]; w._42 = c7[3]; w._43 = c8[3]; w._44 = 1.0f;
+                    g_dev->SetTransform(D3DTS_WORLD, &w);
+                    appliedConstWorld = true;
+                }
+            }
+
             g_dev->SetFVF(packedFvf);
             g_dev->DrawIndexedPrimitiveUP(pt, 0, numVerts, primCount, idx, D3DFMT_INDEX16, g_customVsScratch.data(), outStride);
+
+            if (appliedConstWorld) {
+                g_dev->SetTransform(D3DTS_WORLD, &savedWorld);
+            }
         }
         return;
     }

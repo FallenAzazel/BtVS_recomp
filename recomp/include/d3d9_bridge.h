@@ -38,7 +38,7 @@ void Swap(uint32_t flags);
 void SetViewport(const void* pXboxViewport);
 void SetTransform(uint32_t xboxState, const void* pMatrix);
 void SetVertexShader(uint32_t handle);
-void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl);
+void RegisterVertexShaderDecl(uint32_t handle, const uint32_t* pDecl, int32_t shaderId = -1);
 void SetStreamSource(uint32_t streamNumber, const void* pXboxVB, uint32_t stride);
 void SetIndices(const void* pXboxIB, uint32_t baseVertexIndex);
 void SetTexture(uint32_t stage, const void* pXboxTexture);
