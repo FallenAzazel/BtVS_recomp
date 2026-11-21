@@ -18,6 +18,9 @@ struct AppConfig {
     uint32_t msaa                = 4;    // 0, 2, 4
     uint32_t aniso               = 16;   // 1, 4, 8, 16
     bool     atmosphericFog      = true;
+    int      gammaPercent        = 100;  // 50..200 (100 = 1.00 neutral, >100 lifts dark shadows like CRT)
+    int      brightnessPercent   = 100;  // 50..150 (100 = neutral)
+    int      contrastPercent     = 100;  // 50..150 (100 = 1.00x)
     // Textures
     bool     enableHDTextures    = true;
     bool     dumpTextures        = false;

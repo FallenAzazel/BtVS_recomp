@@ -749,7 +749,145 @@ bool Init(HWND hRenderWnd, uint32_t xboxWidth, uint32_t xboxHeight, uint32_t res
     return true;
 }
 
+// ============================================================================
+// Live GPU Post-Process: CRT Gamma Lift, Brightness & Contrast (Windowed + Fullscreen)
+// ============================================================================
+static std::atomic<int>       g_gammaPercent{100};
+static std::atomic<int>       g_brightnessPercent{100};
+static std::atomic<int>       g_contrastPercent{100};
+static IDirect3DTexture9*     g_postTex = nullptr;
+static IDirect3DPixelShader9* g_postPS  = nullptr;
+static bool                   g_postTriedCompile = false;
+
+void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPercent) {
+    g_gammaPercent.store(std::max(50, std::min(200, gammaPercent)));
+    g_brightnessPercent.store(std::max(50, std::min(150, brightnessPercent)));
+    g_contrastPercent.store(std::max(50, std::min(150, contrastPercent)));
+}
+
+static void ReleasePostResources(bool releaseShader) {
+    if (g_postTex) { g_postTex->Release(); g_postTex = nullptr; }
+    if (releaseShader) {
+        if (g_postPS) { g_postPS->Release(); g_postPS = nullptr; }
+        g_postTriedCompile = false;
+    }
+}
+
+static bool EnsurePostResources() {
+    if (!g_dev) return false;
+    if (!g_postPS && !g_postTriedCompile) {
+        g_postTriedCompile = true;
+        HMODULE hComp = LoadLibraryA("d3dcompiler_47.dll");
+        if (!hComp) hComp = LoadLibraryA("d3dcompiler_43.dll");
+        if (hComp) {
+            struct D3DBlobIface {
+                virtual HRESULT __stdcall QueryInterface(REFIID, void**) = 0;
+                virtual ULONG   __stdcall AddRef() = 0;
+                virtual ULONG   __stdcall Release() = 0;
+                virtual LPVOID  __stdcall GetBufferPointer() = 0;
+                virtual SIZE_T  __stdcall GetBufferSize() = 0;
+            };
+            using D3DCompileFn = HRESULT(__stdcall*)(
+                LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR,
+                UINT, UINT, D3DBlobIface**, D3DBlobIface**);
+            auto fnCompile = reinterpret_cast<D3DCompileFn>(GetProcAddress(hComp, "D3DCompile"));
+            if (fnCompile) {
+                static const char* kPostHlsl =
+                    "sampler2D s0 : register(s0);\n"
+                    "float4 cParams : register(c0);\n"
+                    "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
+                    "    float3 rgb = tex2D(s0, uv).rgb;\n"
+                    "    rgb = pow(max(rgb, 0.0001f), cParams.x);\n"
+                    "    rgb = (rgb - 0.5f) * cParams.z + 0.5f + cParams.y;\n"
+                    "    return float4(saturate(rgb), 1.0f);\n"
+                    "}\n";
+                D3DBlobIface* code = nullptr;
+                D3DBlobIface* err  = nullptr;
+                if (SUCCEEDED(fnCompile(kPostHlsl, std::strlen(kPostHlsl), "buffy_post.hlsl",
+                                        nullptr, nullptr, "main", "ps_2_0", 0, 0, &code, &err)) && code) {
+                    g_dev->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &g_postPS);
+                    code->Release();
+                }
+                if (err) err->Release();
+            }
+        }
+    }
+    if (!g_postPS) return false;
+    if (!g_postTex && g_outW > 0 && g_outH > 0) {
+        g_dev->CreateTexture(g_outW, g_outH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &g_postTex, nullptr);
+    }
+    return g_postTex != nullptr;
+}
+
+static void ApplyColorCorrectionPostPass() {
+    int gam = g_gammaPercent.load();
+    int bri = g_brightnessPercent.load();
+    int con = g_contrastPercent.load();
+    if (gam == 100 && bri == 100 && con == 100) return;
+    if (!EnsurePostResources()) return;
+
+    IDirect3DSurface9* bb = nullptr;
+    IDirect3DSurface9* dstSurf = nullptr;
+    if (FAILED(g_dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    if (FAILED(g_postTex->GetSurfaceLevel(0, &dstSurf)) || !dstSurf) {
+        bb->Release();
+        return;
+    }
+
+    // Resolve MSAA backbuffer into g_postTex, then apply 1-quad Gamma / Brightness / Contrast pass
+    HRESULT hr = g_dev->StretchRect(bb, nullptr, dstSurf, nullptr, D3DTEXF_NONE);
+    dstSurf->Release();
+    bb->Release();
+    if (FAILED(hr)) return;
+
+    D3DVIEWPORT9 prevVp{};
+    bool hadVp = SUCCEEDED(g_dev->GetViewport(&prevVp));
+    D3DVIEWPORT9 fullVp{0, 0, g_outW, g_outH, 0.0f, 1.0f};
+    g_dev->SetViewport(&fullVp);
+
+    g_dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    g_dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    g_dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    g_dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    g_dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    g_dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+    float gammaVal = std::max(0.5f, static_cast<float>(gam) / 100.0f);
+    float params[4] = {
+        1.0f / gammaVal,                                // c0.x = inverse gamma (>100% lifts dark shadows)
+        static_cast<float>(bri - 100) * 0.005f,         // c0.y = brightness offset (-0.25 .. +0.25)
+        static_cast<float>(con) / 100.0f,               // c0.z = contrast scale (0.50 .. 1.50)
+        0.0f
+    };
+    g_dev->SetPixelShader(g_postPS);
+    g_dev->SetPixelShaderConstantF(0, params, 1);
+    g_dev->SetTexture(0, g_postTex);
+    g_dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    g_dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    g_dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    g_dev->SetSamplerState(0, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+    g_dev->SetSamplerState(0, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+
+    struct PostVert { float x, y, z, rhw, u, v; };
+    float w = static_cast<float>(g_outW);
+    float h = static_cast<float>(g_outH);
+    PostVert quad[4] = {
+        { -0.5f,     -0.5f,     0.0f, 1.0f, 0.0f, 0.0f },
+        { w - 0.5f,  -0.5f,     0.0f, 1.0f, 1.0f, 0.0f },
+        { -0.5f,     h - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+        { w - 0.5f,  h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f }
+    };
+    g_dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    g_dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PostVert));
+
+    g_dev->SetPixelShader(nullptr);
+    g_dev->SetTexture(0, nullptr);
+    if (!g_customVS && g_fvf) g_dev->SetFVF(g_fvf);
+    if (hadVp) g_dev->SetViewport(&prevVp);
+}
+
 void Shutdown() {
+    ReleasePostResources(true);
     for (auto& kv : g_texCache) {
         if (kv.second.tex) kv.second.tex->Release();
     }
@@ -1186,6 +1324,7 @@ void Swap(uint32_t /*flags*/) {
         g_tracingThisFrame = false;
     }
     if (g_inScene) {
+        ApplyColorCorrectionPostPass();
         g_dev->EndScene();
         g_inScene = false;
     }
@@ -1228,6 +1367,7 @@ void Swap(uint32_t /*flags*/) {
             pp.BackBufferHeight = oh;
             pp.MultiSampleType  = mt;
             pp.MultiSampleQuality = 0;
+            ReleasePostResources(false);
             if (SUCCEEDED(g_dev->Reset(&pp))) {
                 g_presentParams = pp;
                 g_curScale  = newScale;
