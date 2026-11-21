@@ -670,6 +670,14 @@ static void RebuildConfigControls(int w, int h) {
         addDropdown(205, "Anisotropic Filtering:", afStr);
         y += 6;
         addToggle(206, "Atmospheric Distance Fog", g_cfg->atmosphericFog);
+        y += 6;
+        char gamTxt[16]{}, briTxt[16]{}, conTxt[16]{};
+        std::snprintf(gamTxt, sizeof(gamTxt), "%.2f", g_cfg->gammaPercent / 100.0f);
+        std::snprintf(briTxt, sizeof(briTxt), "%+d%%", g_cfg->brightnessPercent - 100);
+        std::snprintf(conTxt, sizeof(conTxt), "%d%%", g_cfg->contrastPercent);
+        addSlider(207, "Gamma (CRT Lift):", g_cfg->gammaPercent,      50, 200, gamTxt);
+        addSlider(208, "Brightness:",       g_cfg->brightnessPercent, 50, 150, briTxt);
+        addSlider(209, "Contrast:",         g_cfg->contrastPercent,   50, 150, conTxt);
     } else if (g_cfgTab == 2) { // Textures
         addToggle(301, "Enable Custom HD Textures",        g_cfg->enableHDTextures);
         addToggle(302, "Dump Visible Textures to PNG (F8)", g_cfg->dumpTextures);
@@ -769,7 +777,13 @@ static void UpdateSliderFromX(const UiCtrl& c, int mx) {
     float t = static_cast<float>(mx - c.hitRc.left) / static_cast<float>(w);
     t = std::max(0.0f, std::min(1.0f, t));
     int v = c.iMin + static_cast<int>(t * static_cast<float>(c.iMax - c.iMin) + 0.5f);
-    if (c.id == 401) {
+    if (c.id == 207) {
+        g_cfg->gammaPercent = v;
+    } else if (c.id == 208) {
+        g_cfg->brightnessPercent = v;
+    } else if (c.id == 209) {
+        g_cfg->contrastPercent = v;
+    } else if (c.id == 401) {
         g_cfg->masterVolume = v;
         if (v > 0) g_cfg->muteAudio = false;
     } else if (c.id == 502) {
@@ -1071,7 +1085,7 @@ void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int init
         reg = true;
     }
 
-    int dw = 740, dh = 490;
+    int dw = 740, dh = 545;
     RECT rcOwner{};
     int px = CW_USEDEFAULT, py = CW_USEDEFAULT;
     if (hOwner && GetWindowRect(hOwner, &rcOwner)) {
