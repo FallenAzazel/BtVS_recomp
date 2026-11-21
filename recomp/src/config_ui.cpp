@@ -670,14 +670,17 @@ static void RebuildConfigControls(int w, int h) {
         addDropdown(205, "Anisotropic Filtering:", afStr);
         y += 6;
         addToggle(206, "Atmospheric Distance Fog", g_cfg->atmosphericFog);
+        addToggle(210, "Subtle Soft Bloom (Lanterns / Magic)", g_cfg->softBloom);
         y += 6;
-        char gamTxt[16]{}, briTxt[16]{}, conTxt[16]{};
+        char fovTxt[16]{}, gamTxt[16]{}, briTxt[16]{}, conTxt[16]{};
+        std::snprintf(fovTxt, sizeof(fovTxt), "%+d\xB0", g_cfg->fovOffsetDeg);
         std::snprintf(gamTxt, sizeof(gamTxt), "%.2f", g_cfg->gammaPercent / 100.0f);
         std::snprintf(briTxt, sizeof(briTxt), "%+d%%", g_cfg->brightnessPercent - 100);
         std::snprintf(conTxt, sizeof(conTxt), "%d%%", g_cfg->contrastPercent);
-        addSlider(207, "Gamma (CRT Lift):", g_cfg->gammaPercent,      50, 200, gamTxt);
-        addSlider(208, "Brightness:",       g_cfg->brightnessPercent, 50, 150, briTxt);
-        addSlider(209, "Contrast:",         g_cfg->contrastPercent,   50, 150, conTxt);
+        addSlider(211, "Camera FOV Offset:", g_cfg->fovOffsetDeg,      -15, 25,  fovTxt);
+        addSlider(207, "Gamma (CRT Lift):",  g_cfg->gammaPercent,       50, 200, gamTxt);
+        addSlider(208, "Brightness:",        g_cfg->brightnessPercent,  50, 150, briTxt);
+        addSlider(209, "Contrast:",          g_cfg->contrastPercent,    50, 150, conTxt);
     } else if (g_cfgTab == 2) { // Textures
         addToggle(301, "Enable Custom HD Textures",        g_cfg->enableHDTextures);
         addToggle(302, "Dump Visible Textures to PNG (F8)", g_cfg->dumpTextures);
@@ -783,6 +786,8 @@ static void UpdateSliderFromX(const UiCtrl& c, int mx) {
         g_cfg->brightnessPercent = v;
     } else if (c.id == 209) {
         g_cfg->contrastPercent = v;
+    } else if (c.id == 211) {
+        g_cfg->fovOffsetDeg = v;
     } else if (c.id == 401) {
         g_cfg->masterVolume = v;
         if (v > 0) g_cfg->muteAudio = false;
@@ -891,6 +896,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                         else if (c.id == 102) g_cfg->hideMouseInactivity = !g_cfg->hideMouseInactivity;
                         else if (c.id == 103) { g_cfg->showStatusBar = !g_cfg->showStatusBar; relayout = true; }
                         else if (c.id == 206) g_cfg->atmosphericFog = !g_cfg->atmosphericFog;
+                        else if (c.id == 210) g_cfg->softBloom = !g_cfg->softBloom;
                         else if (c.id == 301) g_cfg->enableHDTextures = !g_cfg->enableHDTextures;
                         else if (c.id == 302) g_cfg->dumpTextures = !g_cfg->dumpTextures;
                         else if (c.id == 402) g_cfg->muteAudio = !g_cfg->muteAudio;
@@ -1085,7 +1091,7 @@ void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int init
         reg = true;
     }
 
-    int dw = 740, dh = 545;
+    int dw = 740, dh = 610;
     RECT rcOwner{};
     int px = CW_USEDEFAULT, py = CW_USEDEFAULT;
     if (hOwner && GetWindowRect(hOwner, &rcOwner)) {

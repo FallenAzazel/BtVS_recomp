@@ -34,6 +34,10 @@ void     SetTargetFps(uint32_t fps);
 uint32_t GetTargetFps();
 uint32_t GetMeasuredFps();
 
+// Live Camera FOV Offset in degrees (-15..+25, applied on top of 4:3 / 16:9 / 21:9 Hor+ FOV during gameplay)
+void     SetFovOffsetDeg(int offsetDeg);
+int      GetFovOffsetDeg();
+
 // Controller settings & live status for Configuration UI / Bottom Status Bar
 void     SetRumbleEnabled(bool enabled);
 bool     IsRumbleEnabled();

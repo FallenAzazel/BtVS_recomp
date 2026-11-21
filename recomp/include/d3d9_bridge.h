@@ -29,6 +29,8 @@ uint32_t GetOutputWidth();
 uint32_t GetOutputHeight();
 void SetFogEnabled(bool enabled);
 bool IsFogEnabled();
+void SetBloomEnabled(bool enabled);
+bool IsBloomEnabled();
 void SetColorCorrection(int gammaPercent, int brightnessPercent, int contrastPercent);
 void SetMenuPillarbox(bool enabled);
 void RequestFrameTrace();
