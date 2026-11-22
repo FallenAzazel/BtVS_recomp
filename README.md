@@ -1,3 +1,5 @@
+<img src="https://cdn.freebiesupply.com/logos/large/2x/buffy-the-vampire-slayer-logo-png-transparent.png" alt="BtVS" width="200">
+
 # BtVS Windows Recomp
 ### Buffy the Vampire Slayer (Xbox) — Win32 Recomp & Decomp Toolkit
 
