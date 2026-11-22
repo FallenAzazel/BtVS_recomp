@@ -12,6 +12,7 @@ struct AppConfig {
     bool     showStatusBar       = true;
     bool     subtitlesEnabled    = true;
     bool     autoPauseUnfocused  = false;
+    bool     skipIntroMovies     = false;
     uint32_t buffyCostume        = 0;    // 0=Level Default, 1=Slayer, 2=Cheerleader, 3=The Bronze, 4=Workout
     // Cheats / Trainer
     bool     cheatInfHealth      = false;

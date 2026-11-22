@@ -78,6 +78,7 @@ static void LoadSettingsIni() {
     g_cfg.showStatusBar       = GetPrivateProfileIntA("Game",     "ShowStatusBar",       1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.subtitlesEnabled    = GetPrivateProfileIntA("Game",     "Subtitles",           1,         g_settingsIniPath.c_str()) != 0;
     g_cfg.autoPauseUnfocused  = GetPrivateProfileIntA("Game",     "AutoPauseUnfocused",  0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.skipIntroMovies     = GetPrivateProfileIntA("Game",     "SkipIntroMovies",     0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.buffyCostume        = GetPrivateProfileIntA("Game",     "BuffyCostume",        0,         g_settingsIniPath.c_str());
     g_cfg.cheatInfHealth      = GetPrivateProfileIntA("Cheats",   "InfHealth",           0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.cheatInfPower       = GetPrivateProfileIntA("Cheats",   "InfPower",            0,         g_settingsIniPath.c_str()) != 0;
@@ -116,7 +117,7 @@ static void LoadSettingsIni() {
     if (g_cfg.gammaPercent < 50 || g_cfg.gammaPercent > 200) g_cfg.gammaPercent = 100;
     if (g_cfg.brightnessPercent < 50 || g_cfg.brightnessPercent > 150) g_cfg.brightnessPercent = 100;
     if (g_cfg.contrastPercent < 50 || g_cfg.contrastPercent > 150) g_cfg.contrastPercent = 100;
-    if (g_cfg.buffyCostume > 4) g_cfg.buffyCostume = 0;
+    if (g_cfg.buffyCostume > 8) g_cfg.buffyCostume = 0;
 }
 
 static void SaveSettingsIni() {
@@ -146,6 +147,7 @@ static void SaveSettingsIni() {
     writeU("Game",     "ShowStatusBar",       g_cfg.showStatusBar ? 1 : 0);
     writeU("Game",     "Subtitles",           g_cfg.subtitlesEnabled ? 1 : 0);
     writeU("Game",     "AutoPauseUnfocused",  g_cfg.autoPauseUnfocused ? 1 : 0);
+    writeU("Game",     "SkipIntroMovies",     g_cfg.skipIntroMovies ? 1 : 0);
     writeU("Game",     "BuffyCostume",        static_cast<int>(g_cfg.buffyCostume));
     writeU("Cheats",   "InfHealth",           g_cfg.cheatInfHealth ? 1 : 0);
     writeU("Cheats",   "InfPower",            g_cfg.cheatInfPower ? 1 : 0);
@@ -181,10 +183,16 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     d3d9_bridge::SetColorCorrection(g_cfg.gammaPercent, g_cfg.brightnessPercent, g_cfg.contrastPercent);
     xbe_loader::SetFovOffsetDeg(g_cfg.fovOffsetDeg);
     d3d9_bridge::SetHDTexturesEnabled(g_cfg.enableHDTextures);
+    const char* cosSubdir = (g_cfg.buffyCostume == 5) ? "costume_red_leather"
+                          : ((g_cfg.buffyCostume == 6) ? "costume_silver_club"
+                          : ((g_cfg.buffyCostume == 7) ? "costume_black_dress"
+                          : ((g_cfg.buffyCostume == 8) ? "costume_lilac_wrap" : "")));
+    d3d9_bridge::SetCostumeHDSubdir(cosSubdir);
     d3d9_bridge::SetTextureDumpEnabled(g_cfg.dumpTextures);
     xbe_loader::SetAutoResumeQuickSave(g_cfg.autoResumeQuickSave);
     xbe_loader::SetSubtitlesEnabled(g_cfg.subtitlesEnabled);
     xbe_loader::SetAutoPauseUnfocused(g_cfg.autoPauseUnfocused);
+    xbe_loader::SetSkipIntroMovies(g_cfg.skipIntroMovies);
     xbe_loader::SetCheats(g_cfg.cheatInfHealth, g_cfg.cheatInfPower, g_cfg.cheatInfAmmo, g_cfg.cheatOneHitDust);
     xbe_loader::SetBuffyCostume(g_cfg.buffyCostume);
     xbe_loader::SetTargetFps(g_cfg.targetFps);
@@ -198,7 +206,15 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     dsound_bridge::SetMuteInBackground(g_cfg.muteInBackground);
     SaveSettingsIni();
     if (g_hMainWnd && IsWindow(g_hMainWnd) && prevCostume != g_cfg.buffyCostume) {
-        xbe_loader::RequestCostumeReloadInPlace();
+        auto meshGroup = [](uint32_t c) -> uint32_t {
+            if (c == 1 || c == 5) return 1;            // Slayer mesh
+            if (c == 2 || (c >= 6 && c <= 8)) return 2; // Cheerleader spaghetti-strap mesh
+            return c;
+        };
+        // Switching between costumes that share the same 3D mesh swaps textures live with zero reload!
+        if (meshGroup(prevCostume) != meshGroup(g_cfg.buffyCostume)) {
+            xbe_loader::RequestCostumeReloadInPlace();
+        }
     }
     if (relayout && g_hMainWnd && IsWindow(g_hMainWnd)) {
         LayoutMainWindow(g_hMainWnd);
@@ -487,7 +503,7 @@ static LRESULT CALLBACK BuffyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             g_hStatusBar = config_ui::CreateStatusBar(hWnd, &g_cfg, &g_uiCb);
             g_hRenderWnd = CreateWindowExA(
                 0, "STATIC", "",
-                WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
+                WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | SS_BLACKRECT,
                 0, 0, 1280, 960,
                 hWnd, nullptr, GetModuleHandleA(nullptr), nullptr
             );
@@ -659,6 +675,11 @@ static LRESULT CALLBACK BuffyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
             }
             break;
         }
+        case WM_CTLCOLORSTATIC:
+            if (reinterpret_cast<HWND>(lParam) == g_hRenderWnd) {
+                return reinterpret_cast<LRESULT>(GetStockObject(BLACK_BRUSH));
+            }
+            break;
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(hWnd, &ps);

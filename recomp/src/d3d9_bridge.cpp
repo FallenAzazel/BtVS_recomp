@@ -282,6 +282,7 @@ static std::vector<uint8_t>  g_rhwVertScratch;
 // HD Texture Replacement Pack & Dumper state
 static std::string                              g_hdTexDir;
 static std::string                              g_dumpTexDir;
+static std::string                              g_costumeHDSubdir;
 static std::unordered_map<uint64_t, std::string> g_hdTextureFiles;
 static std::unordered_set<uint64_t>             g_dumpedHashes;
 static std::atomic<bool>                        g_hdTexturesEnabled{true};
@@ -344,27 +345,44 @@ static bool HasSupportedImageExt(const std::string& fn) {
 static void ScanHDTextureDir() {
     g_hdTextureFiles.clear();
     if (g_hdTexDir.empty()) return;
-    DWORD attr = GetFileAttributesA(g_hdTexDir.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    auto scanOne = [](const std::string& dir) {
+        DWORD attr = GetFileAttributesA(dir.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+        std::string pattern = dir + "\\*.*";
+        WIN32_FIND_DATAA fd{};
+        HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string name = fd.cFileName;
+            if (!HasSupportedImageExt(name)) continue;
+            uint64_t hash = 0;
+            if (ParseLeadingHex64(name.c_str(), hash)) {
+                g_hdTextureFiles[hash] = dir + "\\" + name;
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    };
 
-    std::string pattern = g_hdTexDir + "\\*.*";
-    WIN32_FIND_DATAA fd{};
-    HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::string name = fd.cFileName;
-        if (!HasSupportedImageExt(name)) continue;
-        uint64_t hash = 0;
-        if (ParseLeadingHex64(name.c_str(), hash)) {
-            g_hdTextureFiles[hash] = g_hdTexDir + "\\" + name;
-        }
-    } while (FindNextFileA(hFind, &fd));
-    FindClose(hFind);
+    scanOne(g_hdTexDir);
+    if (!g_costumeHDSubdir.empty()) {
+        scanOne(g_hdTexDir + "\\" + g_costumeHDSubdir);
+    }
 
     if (!g_hdTextureFiles.empty()) {
-        LogPrintf("[HDTex] Loaded index of %zu custom HD texture(s) from '%s'\n",
-                  g_hdTextureFiles.size(), g_hdTexDir.c_str());
+        LogPrintf("[HDTex] Loaded index of %zu custom HD texture(s) from '%s'%s%s\n",
+                  g_hdTextureFiles.size(), g_hdTexDir.c_str(),
+                  g_costumeHDSubdir.empty() ? "" : " + ",
+                  g_costumeHDSubdir.c_str());
+    }
+}
+
+void SetCostumeHDSubdir(const char* subdirName) {
+    std::string next = subdirName ? subdirName : "";
+    if (next != g_costumeHDSubdir) {
+        g_costumeHDSubdir = next;
+        ScanHDTextureDir();
+        g_flushCacheNextFrame.store(true);
     }
 }
 

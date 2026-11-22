@@ -1,4 +1,5 @@
 #include "config_ui.h"
+#include "about_logo.h"
 #include "d3d9_bridge.h"
 #include "dsound_bridge.h"
 #include "xbe_loader.h"
@@ -43,6 +44,64 @@ struct Palette {
 
 static bool g_darkMode = true;
 static ULONG_PTR g_uiGdipToken = 0;
+static Gdiplus::Bitmap* g_aboutLogoBmp = nullptr;
+static Gdiplus::Bitmap* g_costumePreviewBmp[4] = {};
+static bool             g_costumePreviewLoaded = false;
+static RECT             g_costumeCardRc[4] = {};
+
+static void EnsureCostumePreviewsLoaded() {
+    if (g_costumePreviewLoaded) return;
+    g_costumePreviewLoaded = true;
+    static const char* kDirs[4] = {
+        "costume_red_leather", "costume_silver_club",
+        "costume_black_dress", "costume_lilac_wrap"
+    };
+    char modPath[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, modPath, MAX_PATH);
+    std::string baseDir(modPath);
+    for (int up = 0; up < 3; ++up) {
+        size_t s = baseDir.find_last_of("\\/");
+        if (s != std::string::npos) baseDir.resize(s);
+    }
+    for (int i = 0; i < 4; ++i) {
+        std::string p1 = std::string("recomp\\hd_textures\\") + kDirs[i] + "\\preview.jpg";
+        std::string p2 = baseDir + "\\recomp\\hd_textures\\" + kDirs[i] + "\\preview.jpg";
+        std::string chosen = (GetFileAttributesA(p1.c_str()) != INVALID_FILE_ATTRIBUTES) ? p1 : p2;
+        if (GetFileAttributesA(chosen.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::wstring wp(chosen.begin(), chosen.end());
+            Gdiplus::Bitmap* b = Gdiplus::Bitmap::FromFile(wp.c_str(), FALSE);
+            if (b && b->GetLastStatus() == Gdiplus::Ok) {
+                g_costumePreviewBmp[i] = b;
+            } else {
+                delete b;
+            }
+        }
+    }
+}
+
+static Gdiplus::Bitmap* GetAboutLogoBitmap() {
+    if (g_aboutLogoBmp) return g_aboutLogoBmp;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sizeof(kAboutLogoPng));
+    if (!hMem) return nullptr;
+    void* pMem = GlobalLock(hMem);
+    if (pMem) {
+        std::memcpy(pMem, kAboutLogoPng, sizeof(kAboutLogoPng));
+        GlobalUnlock(hMem);
+    }
+    IStream* pStream = nullptr;
+    if (SUCCEEDED(CreateStreamOnHGlobal(hMem, TRUE, &pStream)) && pStream) {
+        Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(pStream, FALSE);
+        pStream->Release();
+        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
+            g_aboutLogoBmp = bmp;
+        } else {
+            delete bmp;
+        }
+    } else {
+        GlobalFree(hMem);
+    }
+    return g_aboutLogoBmp;
+}
 
 static void EnsureGdip() {
     if (g_uiGdipToken == 0) {
@@ -687,7 +746,7 @@ HWND CreateStatusBar(HWND hParent, AppConfig* cfg, const Callbacks* cb) {
 // ============================================================================
 // 3. Modern Dark Buffy Configuration Window (Sidebar + Toggles + Sliders + Dropdowns)
 // ============================================================================
-static const char* kTabNames[7] = { "General", "Graphics", "Textures", "Audio", "Controls", "Debug", "About" };
+static const char* kTabNames[8] = { "General", "Graphics", "Textures", "Costume Mods", "Audio", "Controls", "Debug", "About" };
 
 enum class CtrlKind { Toggle, Dropdown, Slider, Button, Label };
 struct UiCtrl {
@@ -787,16 +846,10 @@ static void RebuildConfigControls(int w, int h) {
     };
 
     if (g_cfgTab == 0) { // General
-        const char* cosStr = (g_cfg->buffyCostume == 1) ? "Slayer (Blue Top)"
-                           : ((g_cfg->buffyCostume == 2) ? "Cheerleader"
-                           : ((g_cfg->buffyCostume == 3) ? "The Bronze (Club)"
-                           : ((g_cfg->buffyCostume == 4) ? "Workout / Sport" : "Level Default")));
-        addDropdown(107, "Buffy Costume:", cosStr);
-        addLabel("  (Automatically reloads your current spot with the new outfit)");
-        y += 4;
         addToggle(101, "Auto-Resume Quick Save on Launch", g_cfg->autoResumeQuickSave);
         addToggle(108, "Show Cutscene Subtitles",          g_cfg->subtitlesEnabled);
         addToggle(109, "Pause Game When Unfocused (Alt-Tab)", g_cfg->autoPauseUnfocused);
+        addToggle(110, "Skip Intro Logos on Launch",          g_cfg->skipIntroMovies);
         addToggle(102, "Hide Mouse Cursor on Inactivity",  g_cfg->hideMouseInactivity);
         addToggle(103, "Show Bottom Status Bar",           g_cfg->showStatusBar);
         y += 12;
@@ -847,14 +900,25 @@ static void RebuildConfigControls(int w, int h) {
         y += 42;
         addButton(304, "Open HD Textures Folder...",     leftX, 200);
         addButton(305, "Open Dumped Textures Folder...", leftX + 212, 215);
-    } else if (g_cfgTab == 3) { // Audio
+    } else if (g_cfgTab == 3) { // Costume Mods
+        const char* cosStr = (g_cfg->buffyCostume == 1) ? "Slayer (Blue Top)"
+                           : ((g_cfg->buffyCostume == 2) ? "Cheerleader"
+                           : ((g_cfg->buffyCostume == 3) ? "The Bronze (Club)"
+                           : ((g_cfg->buffyCostume == 4) ? "Workout / Sport"
+                           : ((g_cfg->buffyCostume == 5) ? "Red Leather (Custom HD)"
+                           : ((g_cfg->buffyCostume == 6) ? "Silver Sequin Club (Custom HD)"
+                           : ((g_cfg->buffyCostume == 7) ? "Black Mini Dress (Custom HD)"
+                           : ((g_cfg->buffyCostume == 8) ? "Lilac Wrap & Black Pants (Custom HD)" : "Level Default")))))));
+        addDropdown(107, "Buffy Costume:", cosStr);
+        addLabel("  Swaps instantly for matching 3D meshes, or reloads in-place at your current spot.");
+    } else if (g_cfgTab == 4) { // Audio
         char volTxt[16]{};
         std::snprintf(volTxt, sizeof(volTxt), "%d%%", g_cfg->masterVolume);
         addSlider(401, "Master Volume:", g_cfg->masterVolume, 0, 100, volTxt);
         y += 6;
         addToggle(402, "Mute Audio", g_cfg->muteAudio);
         addToggle(403, "Mute Audio When in Background", g_cfg->muteInBackground);
-    } else if (g_cfgTab == 4) { // Controls
+    } else if (g_cfgTab == 5) { // Controls
         char padTxt[96]{};
         if (xbe_loader::IsGamepadConnected()) {
             std::snprintf(padTxt, sizeof(padTxt), "Controller: Connected (Xbox Pad %u)  |  Mouse-Look: Click Viewport, Alt/Esc Releases", xbe_loader::GetActivePadSlot());
@@ -889,11 +953,11 @@ static void RebuildConfigControls(int w, int h) {
             y += 35;
         }
         addButton(520, "Reset Default Keybinds", leftX, 185);
-    } else if (g_cfgTab == 5) { // Debug
+    } else if (g_cfgTab == 6) { // Debug
         addToggle(601, "Show Debug Telemetry Log (F2)", g_cfg->showDebugLog);
         y += 12;
         addButton(602, "Trace 1 Frame to Log (F7)", leftX, 200);
-    } else if (g_cfgTab == 6) { // About
+    } else if (g_cfgTab == 7) { // About
         // Top 132px reserved for centered BtVS logo emblem drawn in WM_PAINT
         y += 136;
         addLabel("Buffy the Vampire Slayer (Original Xbox) - Native Win32 Recomp & Runtime");
@@ -925,6 +989,11 @@ static void HandleDropdownClick(HWND hWnd, const UiCtrl& c) {
         AppendMenuA(hPop, MF_STRING, 3, "Cheerleader");
         AppendMenuA(hPop, MF_STRING, 4, "The Bronze (Club)");
         AppendMenuA(hPop, MF_STRING, 5, "Workout / Sport");
+        AppendMenuA(hPop, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(hPop, MF_STRING, 6, "Red Leather (Custom HD)");
+        AppendMenuA(hPop, MF_STRING, 7, "Silver Sequin Club (Custom HD)");
+        AppendMenuA(hPop, MF_STRING, 8, "Black Mini Dress (Custom HD)");
+        AppendMenuA(hPop, MF_STRING, 9, "Lilac Wrap & Black Pants (Custom HD)");
     } else if (c.id == 201) {
         AppendMenuA(hPop, MF_STRING, 1, "4:3 Classic");
         AppendMenuA(hPop, MF_STRING, 2, "16:9 Widescreen");
@@ -1013,7 +1082,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
             }
             int ns = -1;
             if (x >= 12 && x < 152) {
-                for (int i = 0; i < 7; ++i) {
+                for (int i = 0; i < 8; ++i) {
                     int sy = 16 + i * 38;
                     if (y >= sy && y < sy + 32) { ns = i; break; }
                 }
@@ -1057,7 +1126,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 
             // Sidebar tabs
             if (x >= 12 && x < 152) {
-                for (int i = 0; i < 7; ++i) {
+                for (int i = 0; i < 8; ++i) {
                     int sy = 16 + i * 38;
                     if (y >= sy && y < sy + 32) {
                         g_cfgTab = i;
@@ -1080,6 +1149,19 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                 DestroyWindow(hWnd);
                 return 0;
             }
+            // Costume inspiration gallery card clicks on Costume Mods tab
+            if (g_cfgTab == 3 && g_cfg && g_cb.onApplyConfig) {
+                for (int i = 0; i < 4; ++i) {
+                    if (g_costumePreviewBmp[i] &&
+                        x >= g_costumeCardRc[i].left && x < g_costumeCardRc[i].right &&
+                        y >= g_costumeCardRc[i].top  && y < g_costumeCardRc[i].bottom) {
+                        g_cfg->buffyCostume = static_cast<uint32_t>(5 + i);
+                        g_cb.onApplyConfig(*g_cfg, false);
+                        InvalidateRect(hWnd, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+            }
             // Active page controls
             for (const auto& c : g_ctrls) {
                 if (c.id < 0) continue;
@@ -1091,6 +1173,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                         if (c.id == 101) g_cfg->autoResumeQuickSave = !g_cfg->autoResumeQuickSave;
                         else if (c.id == 108) g_cfg->subtitlesEnabled = !g_cfg->subtitlesEnabled;
                         else if (c.id == 109) g_cfg->autoPauseUnfocused = !g_cfg->autoPauseUnfocused;
+                        else if (c.id == 110) g_cfg->skipIntroMovies = !g_cfg->skipIntroMovies;
                         else if (c.id == 102) g_cfg->hideMouseInactivity = !g_cfg->hideMouseInactivity;
                         else if (c.id == 103) { g_cfg->showStatusBar = !g_cfg->showStatusBar; relayout = true; }
                         else if (c.id == 206) g_cfg->atmosphericFog = !g_cfg->atmosphericFog;
@@ -1184,7 +1267,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                     g.DrawLine(&sep, 0, h - 54, w, h - 54);
 
                     // Sidebar tab buttons
-                    for (int i = 0; i < 7; ++i) {
+                    for (int i = 0; i < 8; ++i) {
                         float sy = static_cast<float>(16 + i * 38);
                         bool sel = (i == g_cfgTab);
                         if (sel) {
@@ -1203,47 +1286,97 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                     g.DrawLine(&accPen, 186, 44, 266, 44);
                     g.DrawLine(&sep, 186, 45, w - 24, 45);
 
-                    // Centered stylized BtVS logo emblem at top of About panel
-                    if (g_cfgTab == 6) {
+                    // Clickable Custom HD Costume Inspiration Gallery on Costume Mods tab
+                    if (g_cfgTab == 3) {
+                        EnsureCostumePreviewsLoaded();
+                        bool anyPrev = g_costumePreviewBmp[0] || g_costumePreviewBmp[1] ||
+                                       g_costumePreviewBmp[2] || g_costumePreviewBmp[3];
+                        if (anyPrev) {
+                            static const char* kCardNames[4] = {
+                                "Red Leather", "Silver Club", "Black Dress", "Lilac Wrap"
+                            };
+                            int gx = 186;
+                            int gy = 172;
+                            DrawTextStr(g, "Custom HD Costume Inspirations (Click a Photo to Equip):",
+                                        Gdiplus::RectF(static_cast<float>(gx), static_cast<float>(gy - 24), 460.0f, 20.0f),
+                                        pal.textDim, 9.0f, true);
+                            int cardW = 122;
+                            int cardH = 228;
+                            int gap   = 10;
+                            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                            for (int i = 0; i < 4; ++i) {
+                                int cx = gx + i * (cardW + gap);
+                                g_costumeCardRc[i] = { cx, gy, cx + cardW, gy + cardH };
+                                bool selected = (g_cfg && g_cfg->buffyCostume == static_cast<uint32_t>(5 + i));
+                                FillRoundRect(g, static_cast<float>(cx), static_cast<float>(gy),
+                                              static_cast<float>(cardW), static_cast<float>(cardH),
+                                              7.0f, selected ? pal.accentBg : pal.ctrlBg);
+                                DrawRoundRect(g, static_cast<float>(cx), static_cast<float>(gy),
+                                              static_cast<float>(cardW), static_cast<float>(cardH),
+                                              7.0f, selected ? pal.accent : pal.border, selected ? 2.0f : 1.0f);
+                                if (g_costumePreviewBmp[i]) {
+                                    float iw = static_cast<float>(g_costumePreviewBmp[i]->GetWidth());
+                                    float ih = static_cast<float>(g_costumePreviewBmp[i]->GetHeight());
+                                    float boxW = static_cast<float>(cardW - 10);
+                                    float boxH = static_cast<float>(cardH - 28);
+                                    float scale = std::min(boxW / std::max(1.0f, iw), boxH / std::max(1.0f, ih));
+                                    float dw = iw * scale;
+                                    float dh = ih * scale;
+                                    float dx = static_cast<float>(cx) + 5.0f + (boxW - dw) * 0.5f;
+                                    float dy = static_cast<float>(gy) + 5.0f + (boxH - dh) * 0.5f;
+                                    g.DrawImage(g_costumePreviewBmp[i], dx, dy, dw, dh);
+                                }
+                                DrawTextStr(g, kCardNames[i],
+                                            Gdiplus::RectF(static_cast<float>(cx), static_cast<float>(gy + cardH - 21),
+                                                           static_cast<float>(cardW), 18.0f),
+                                            selected ? pal.text : pal.textDim, 8.2f, selected, Gdiplus::StringAlignmentCenter);
+                            }
+                        }
+                    }
+
+                    // Centered BtVS logo at top of About panel
+                    if (g_cfgTab == 7) {
                         float panelL = 186.0f;
                         float panelW = static_cast<float>(w - 210);
-                        float logoW  = 340.0f;
-                        float logoH  = 112.0f;
-                        float logoX  = panelL + (panelW - logoW) * 0.5f;
-                        float logoY  = 60.0f;
+                        Gdiplus::Bitmap* logo = GetAboutLogoBitmap();
+                        if (logo) {
+                            float logoH = 122.0f;
+                            float logoW = logoH * (static_cast<float>(kAboutLogoWidth) / static_cast<float>(kAboutLogoHeight));
+                            float logoX = panelL + (panelW - logoW) * 0.5f;
+                            float logoY = 56.0f;
+                            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
 
-                        // Dark crimson crest backdrop with glowing accent frame
-                        FillRoundRect(g, logoX, logoY, logoW, logoH, 12.0f, Gdiplus::Color(255, 34, 14, 26));
-                        Gdiplus::Pen crestPen(pal.accent, 1.8f);
-                        Gdiplus::GraphicsPath crestPath;
-                        crestPath.AddArc(logoX, logoY, 24.0f, 24.0f, 180.0f, 90.0f);
-                        crestPath.AddArc(logoX + logoW - 24.0f, logoY, 24.0f, 24.0f, 270.0f, 90.0f);
-                        crestPath.AddArc(logoX + logoW - 24.0f, logoY + logoH - 24.0f, 24.0f, 24.0f, 0.0f, 90.0f);
-                        crestPath.AddArc(logoX, logoY + logoH - 24.0f, 24.0f, 24.0f, 90.0f, 90.0f);
-                        crestPath.CloseFigure();
-                        g.DrawPath(&crestPen, &crestPath);
+                            // Subtle crimson glow shadow behind logo
+                            Gdiplus::ImageAttributes iaGlow;
+                            Gdiplus::ColorMatrix cmGlow = { {
+                                { 0.91f, 0.0f,  0.0f,  0.0f, 0.0f },
+                                { 0.0f,  0.12f, 0.0f,  0.0f, 0.0f },
+                                { 0.0f,  0.0f,  0.39f, 0.0f, 0.0f },
+                                { 0.0f,  0.0f,  0.0f,  0.55f, 0.0f },
+                                { 0.0f,  0.0f,  0.0f,  0.0f, 1.0f }
+                            } };
+                            iaGlow.SetColorMatrix(&cmGlow, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+                            g.DrawImage(logo,
+                                        Gdiplus::RectF(logoX + 2.0f, logoY + 2.0f, logoW, logoH),
+                                        0.0f, 0.0f, static_cast<float>(kAboutLogoWidth), static_cast<float>(kAboutLogoHeight),
+                                        Gdiplus::UnitPixel, &iaGlow);
 
-                        // Stylized Gothic "BtVS" / "BUFFY THE VAMPIRE SLAYER" wordmark
-                        Gdiplus::StringFormat sfCenter;
-                        sfCenter.SetAlignment(Gdiplus::StringAlignmentCenter);
-                        sfCenter.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-
-                        Gdiplus::Font fBuffy(L"Georgia", 26.0f, Gdiplus::FontStyleBold | Gdiplus::FontStyleItalic, Gdiplus::UnitPoint);
-                        Gdiplus::SolidBrush brGlow(Gdiplus::Color(110, 233, 30, 99));
-                        Gdiplus::SolidBrush brTitle(Gdiplus::Color(255, 250, 235, 245));
-                        g.DrawString(L"BUFFY", -1, &fBuffy, Gdiplus::RectF(logoX + 2.0f, logoY + 12.0f, logoW, 44.0f), &sfCenter, &brGlow);
-                        g.DrawString(L"BUFFY", -1, &fBuffy, Gdiplus::RectF(logoX, logoY + 10.0f, logoW, 44.0f), &sfCenter, &brTitle);
-
-                        Gdiplus::Font fSub(L"Georgia", 10.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
-                        Gdiplus::SolidBrush brSub(Gdiplus::Color(255, 233, 90, 145));
-                        g.DrawString(L"THE VAMPIRE SLAYER", -1, &fSub, Gdiplus::RectF(logoX, logoY + 54.0f, logoW, 24.0f), &sfCenter, &brSub);
-
-                        Gdiplus::Pen divPen(Gdiplus::Color(120, 233, 30, 99), 1.0f);
-                        g.DrawLine(&divPen, logoX + 52.0f, logoY + 80.0f, logoX + logoW - 52.0f, logoY + 80.0f);
-
-                        Gdiplus::Font fTag(L"Segoe UI", 8.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
-                        Gdiplus::SolidBrush brTag(pal.textDim);
-                        g.DrawString(L"BtVS  \x2022  XBOX TO WIN32 RECOMP", -1, &fTag, Gdiplus::RectF(logoX, logoY + 84.0f, logoW, 22.0f), &sfCenter, &brTag);
+                            // Crisp main logo (ivory-white in Dark Mode, deep charcoal in Light Mode)
+                            Gdiplus::ImageAttributes iaMain;
+                            float tint = g_darkMode ? 0.96f : 0.12f;
+                            Gdiplus::ColorMatrix cmMain = { {
+                                { tint, 0.0f, 0.0f, 0.0f, 0.0f },
+                                { 0.0f, tint, 0.0f, 0.0f, 0.0f },
+                                { 0.0f, 0.0f, tint, 0.0f, 0.0f },
+                                { 0.0f, 0.0f, 0.0f, 1.0f, 0.0f },
+                                { 0.0f, 0.0f, 0.0f, 0.0f, 1.0f }
+                            } };
+                            iaMain.SetColorMatrix(&cmMain, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+                            g.DrawImage(logo,
+                                        Gdiplus::RectF(logoX, logoY, logoW, logoH),
+                                        0.0f, 0.0f, static_cast<float>(kAboutLogoWidth), static_cast<float>(kAboutLogoHeight),
+                                        Gdiplus::UnitPixel, &iaMain);
+                        }
                     }
 
                     // Controls
@@ -1340,7 +1473,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int initialTab) {
     if (cfg) g_cfg = cfg;
     if (cb)  g_cb  = *cb;
-    if (initialTab >= 0 && initialTab < 7) g_cfgTab = initialTab;
+    if (initialTab >= 0 && initialTab < 8) g_cfgTab = initialTab;
 
     if (g_hCfgWnd && IsWindow(g_hCfgWnd)) {
         SetForegroundWindow(g_hCfgWnd);
@@ -1383,6 +1516,17 @@ void CloseConfigDialog() {
 
 void Shutdown() {
     CloseConfigDialog();
+    if (g_aboutLogoBmp) {
+        delete g_aboutLogoBmp;
+        g_aboutLogoBmp = nullptr;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (g_costumePreviewBmp[i]) {
+            delete g_costumePreviewBmp[i];
+            g_costumePreviewBmp[i] = nullptr;
+        }
+    }
+    g_costumePreviewLoaded = false;
     if (g_uiGdipToken != 0) {
         Gdiplus::GdiplusShutdown(g_uiGdipToken);
         g_uiGdipToken = 0;

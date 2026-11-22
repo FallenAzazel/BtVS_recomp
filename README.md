@@ -26,7 +26,7 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
   - **5-Slot Quick Saves** (`F5`/`F6`, `Shift+1..5`, or `Game → Quick Save Slots`) with optional **Auto-Resume on Launch**
   - **Chapter / Arena Launcher** (`Game → Jump to Level / Arena`) to jump straight into any of the 13 chapters, 4 arenas, or *Buffy History 101*
   - **Buffy Costume Swapper** (`Config → General`): swap between *Slayer*, *Cheerleader*, *The Bronze*, and *Workout* outfits in-place at your current position
-  - **Cutscene Subtitles** toggle (`Config → General → Show Cutscene Subtitles`)
+  - **Cutscene Subtitles** toggle (`Config → General → Show Cutscene Subtitles`) and **Native DirectShow `.wmv` FMV Playback** (plays the original 2002 Fox / EA / Collective intro videos with synced audio, skippable via `Space`/`Enter`/`Click`/Gamepad, with an optional **Skip Intro Logos** toggle)
   - **Borderless Fullscreen (`F11`)** and **Auto-Pause When Unfocused (Alt-Tab)** toggle
   - Modern dark/light-aware Win32 **Configuration UI (`F1`)** including an **About** tab
 - **Xbox Kernel & XAPI Shims** (`recomp/src/xboxkrnl_win32.cpp`, `recomp/src/xbe_loader.cpp`):
@@ -40,8 +40,9 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
 ## What's New
 
 ### 2026-11-21
-- **Local 4× HD Texture Upscaler (`tools/upscale_textures.py`)**: Zero-dependency batch upscaler that converts dumped Xbox textures (`recomp/dump_textures/`) into alpha-safe 4× HD PNGs in `recomp/hd_textures/` (supports optional `realesrgan-ncnn-vulkan` AI upscaling, Pillow, or built-in Windows GDI+ `HighQualityBicubic` with RGB edge-bleed to prevent UI/text halos).
-- **Real-Time GPU Sharpening (`Config → Graphics → Sharpness (CAS)`)**: Added a 5-tap AMD FidelityFX CAS-inspired Contrast Adaptive Sharpening slider (`0%–100%`) to the `ps_2_0` post-processing pipeline for crisp menus, HUD text, and world textures without edge halos.
+- **Native `.wmv` FMV Playback & HD Movie Overrides (`recomp/hd_movies/`)**: Plays the original 2002 intro videos (`Logo_Legal`, `Logo_EA`, `Logo_Fox`, `Logo_Collective`) and `attract.wmv` trailer natively via DirectShow with synced audio, jet-black 16:9/21:9 pillarboxing, skippable controls, a **Skip Intro Logos on Launch** toggle in `Config → General`, and automatic `.mp4`/`.wmv`/`.avi` HD overrides in `recomp/hd_movies/`.
+- **Cinema Vignette & Retro 480p CRT Scanlines**: Added live toggles in `Config → Graphics` inside the upgraded `ps_3_0` post-processing pipeline alongside **Sharpness (CAS)** (`0%–100%`).
+- **Local 4× HD Texture Upscaler (`tools/upscale_textures.py`)**: Zero-dependency batch upscaler that converts dumped Xbox textures (`recomp/dump_textures/`) into alpha-safe 4× HD PNGs in `recomp/hd_textures/` (supports optional `realesrgan-ncnn-vulkan` AI upscaling, Pillow, or built-in Windows GDI+ `HighQualityBicubic` with RGB edge-bleed to prevent UI/text halos). Also added a clickable **`DUMP: OFF / ON`** status bar pill and fixed HD texture cache keying by `xtex->Data` + hash.
 - **System-Matched Dark/Light Popup Menus**: All expanded Win32 dropdown menus (`Game`, `View`, `Cheats`, `Quick Save Slots`, `Jump to Level`, and Config dropdowns) now follow your Windows Dark/Light theme automatically.
 - **Photo Mode / Free Camera (`F10` / `View → Photo Mode`)**: Freezes gameplay cleanly, hides all 2D HUD overlays & 3D weapon icons, and lets you fly freely with `WASD`, `Q`/`E`, and Mouse/Arrows (`Shift` = fast, `Ctrl` = slow).
 - **Clean PNG Screenshots (`F12` / `View → Take Screenshot`)**: Captures full-resolution, post-processed, MSAA-resolved PNG screenshots directly to `recomp/screenshots/Buffy_YYYYMMDD_HHMMSS.png`.
@@ -95,6 +96,9 @@ python tools/upscale_textures.py --scale 4
 1. Make sure **`HD TEX: ON`** is enabled in the bottom status bar (or `Config → Textures → Enable Custom HD Textures`).
 2. Press **`F9`** in-game (or click **Reload HD Textures** in `Config → Textures`) to hot-reload your new 4× HD textures immediately.
 3. Adjust **`Config → Graphics → Sharpness (CAS)`** (`0%–100%`, default `35%`) for real-time halo-free contrast-adaptive sharpening across both 2D menus and 3D gameplay.
+
+### Optional — HD FMV Video Replacements (`recomp/hd_movies/`)
+Drop locally upscaled `.mp4`, `.wmv`, or `.avi` replacements (e.g. `Logo_Fox.mp4`, `Logo_EA.mp4`, `Logo_Collective.mp4`, `Logo_Legal.mp4`, `attract.mp4`) into `recomp/hd_movies/` — the DirectShow movie player automatically detects and plays them at full HD/4K instead of the 480p originals.
 
 ---
 
