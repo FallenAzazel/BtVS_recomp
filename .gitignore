@@ -19,7 +19,13 @@ recomp/build/
 recomp/cache/
 recomp/saves/
 recomp/dump_textures/
-recomp/hd_textures/
+recomp/hd_textures/*
+!recomp/hd_textures/costume_red_leather/
+!recomp/hd_textures/costume_silver_club/
+!recomp/hd_textures/costume_black_dress/
+!recomp/hd_textures/costume_lilac_wrap/
+recomp/hd_textures/costume_*/preview.jpg
+recomp/hd_movies/
 recomp/screenshots/
 recomp/settings.ini
 

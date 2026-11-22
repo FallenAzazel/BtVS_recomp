@@ -17,6 +17,7 @@ void SetTextureDumpEnabled(bool enabled);
 bool IsTextureDumpEnabled();
 bool ToggleTextureDump();
 void ReloadHDTextures();
+void SetCostumeHDSubdir(const char* subdirName);
 
 // Live graphics settings (applied cleanly on next Present)
 // aspectMode: 0 = 4:3 Classic, 1 = 16:9 Widescreen, 2 = 21:9 Ultrawide (3440x1440)

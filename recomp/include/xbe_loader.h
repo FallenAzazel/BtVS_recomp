@@ -29,6 +29,7 @@ void SetAutoResumeQuickSave(bool enabled);
 void SetSubtitlesEnabled(bool enabled);
 bool IsSubtitlesEnabled();
 void SetAutoPauseUnfocused(bool enabled);
+void SetSkipIntroMovies(bool enabled);
 void SetCheats(bool infHealth, bool infPower, bool infAmmoDurability, bool oneHitDust);
 void ShowStatusNotice(const char* msg);
 

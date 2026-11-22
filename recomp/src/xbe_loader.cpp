@@ -3,6 +3,7 @@
 #include "d3d9_bridge.h"
 #include "dsound_bridge.h"
 #include <mmsystem.h>
+#include <dshow.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "strmiids.lib")
 
 namespace xbe_loader {
 
@@ -708,13 +710,16 @@ static HANDLE __stdcall Detour_CreateFileA(
     char winPath[512]{};
     xboxkrnl::TranslateXboxPath(lpFileName, winPath, sizeof(winPath));
     // Optional Buffy costume override on gameplay level .pak opens
-    if (g_buffyCostume >= 1 && g_buffyCostume <= 4 && dwCreationDisposition == OPEN_EXISTING && winPath[0]) {
+    if (g_buffyCostume >= 1 && g_buffyCostume <= 8 && dwCreationDisposition == OPEN_EXISTING && winPath[0]) {
+        // 1,5 -> Slayer mesh (1); 2,6,7,8 -> Cheerleader spaghetti-strap mesh (2); 3 -> Bronze (3); 4 -> Workout (4)
+        const uint32_t meshCostume = (g_buffyCostume == 5) ? 1u
+                                   : ((g_buffyCostume >= 6 && g_buffyCostume <= 8) ? 2u : g_buffyCostume);
         std::string wpLow(winPath);
         for (char& ch : wpLow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         if (StrEndsWithI(wpLow, ".pak") && !StrEndsWithI(wpLow, "res_null.pak") &&
             wpLow.find("\\pak\\res_") != std::string::npos) {
             char patchedPak[512]{};
-            if (BuildCostumePatchedPak(winPath, g_buffyCostume, patchedPak, sizeof(patchedPak))) {
+            if (BuildCostumePatchedPak(winPath, meshCostume, patchedPak, sizeof(patchedPak))) {
                 std::strncpy(winPath, patchedPak, sizeof(winPath) - 1);
                 winPath[sizeof(winPath) - 1] = '\0';
             }
@@ -893,6 +898,7 @@ static char          g_jumpMapName[128] = {};
 static bool          g_mouseLookEnabled = false;
 static bool          g_subtitlesEnabled = true;
 static bool          g_autoPauseUnfocused = false;
+static bool          g_skipIntroMovies    = false;
 static bool          g_cheatInfHealth     = false;
 static bool          g_cheatInfPower      = false;
 static bool          g_cheatInfAmmo       = false;
@@ -1565,9 +1571,24 @@ static bool __cdecl Detour_ScriptError(const char* msg) {
     return false;
 }
 
+static void PlayXboxMovieWmv(const char* xboxPath, bool bLoop, bool bSkippable);
+
 static void __cdecl Detour_RunInstaller(bool bForce) {
     LogPrintf("[xinstall] Detour_RunInstaller(bForce=%s) invoked from Xbox _main!\n", bForce ? "true" : "false");
     RunInstaller(bForce);
+    // Original Xbox RunInstaller plays the 4 intro logo FMVs on cold boot
+    if (!g_skipIntroMovies && !g_hasLastLaunchData && !g_autoResumeQuick) {
+        static const char* kIntroLogos[4] = {
+            "D:\\Interfc\\Logo_Legal.wmv",
+            "D:\\Interfc\\Logo_EA.wmv",
+            "D:\\Interfc\\Logo_Fox.wmv",
+            "D:\\Interfc\\Logo_Collective.wmv"
+        };
+        for (int i = 0; i < 4; ++i) {
+            if (!g_hWnd || !IsWindow(g_hWnd)) break;
+            PlayXboxMovieWmv(kIntroLogos[i], false, true);
+        }
+    }
 }
 
 // Safe host-backed replacement for TResourcePack::ReadIndex (0x002B7250).
@@ -2294,6 +2315,235 @@ static bool __fastcall Detour_RenderRectangle(
     return true;
 }
 
+static bool ContainsCaseInsensitive(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    size_t nlen = std::strlen(needle);
+    for (const char* p = hay; *p; ++p) {
+        if (_strnicmp(p, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+static void PlayXboxMovieWmv(const char* xboxPath, bool bLoop, bool bSkippable) {
+    if (!xboxPath || !xboxPath[0] || !g_hWnd || !IsWindow(g_hWnd)) return;
+
+    // Skip looping background loading spinners (loading_in, summoning, channeling, etc.) & INSTALLING.wmv
+    if (bLoop || ContainsCaseInsensitive(xboxPath, "INSTALLING")) return;
+    if (g_skipIntroMovies && ContainsCaseInsensitive(xboxPath, "Logo_")) {
+        LogPrintf("[Movie_Play] Skipping intro movie '%s' (Skip Intro Logos enabled)\n", xboxPath);
+        return;
+    }
+
+    char hostPath[512]{};
+    auto tryResolve = [&](const char* candidate) -> bool {
+        xboxkrnl::TranslateXboxPath(candidate, hostPath, sizeof(hostPath));
+        return GetFileAttributesA(hostPath) != INVALID_FILE_ATTRIBUTES;
+    };
+
+    bool found = false;
+    // 1. Check optional HD FMV override folder: recomp\hd_movies\<stem>.(mp4|wmv|avi)
+    {
+        const char* base = xboxPath;
+        for (const char* p = xboxPath; *p; ++p) {
+            if (*p == '\\' || *p == '/') base = p + 1;
+        }
+        std::string stem = base;
+        size_t dot = stem.find_last_of('.');
+        if (dot != std::string::npos) stem.resize(dot);
+
+        char cacheRoot[512]{};
+        xboxkrnl::TranslateXboxPath("Z:\\", cacheRoot, sizeof(cacheRoot));
+        std::string hdMoviesDir = cacheRoot;
+        while (!hdMoviesDir.empty() && (hdMoviesDir.back() == '\\' || hdMoviesDir.back() == '/')) {
+            hdMoviesDir.pop_back();
+        }
+        size_t slash = hdMoviesDir.find_last_of("\\/");
+        if (slash != std::string::npos && !stem.empty()) {
+            hdMoviesDir = hdMoviesDir.substr(0, slash) + "\\hd_movies";
+            CreateDirectoryA(hdMoviesDir.c_str(), nullptr);
+            static const char* kExts[3] = { ".mp4", ".wmv", ".avi" };
+            for (const char* ext : kExts) {
+                std::string cand = hdMoviesDir + "\\" + stem + ext;
+                if (GetFileAttributesA(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    std::snprintf(hostPath, sizeof(hostPath), "%s", cand.c_str());
+                    LogPrintf("[Movie_Play] Using HD movie override: '%s'\n", hostPath);
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!found) {
+        if (xboxPath[0] && xboxPath[1] == ':') {
+            found = tryResolve(xboxPath);
+        } else {
+            // Slate Engine passes relative paths like "interfc\Logo_Fox.wmv" or "interfc\attract.wmv"
+            std::string zPath = std::string("Z:\\") + xboxPath;
+            std::string dPath = std::string("D:\\") + xboxPath;
+            found = tryResolve(zPath.c_str()) || tryResolve(dPath.c_str()) || tryResolve(xboxPath);
+        }
+    }
+    if (!found) {
+        LogPrintf("[Movie_Play] File not found for '%s' (last tried: '%s')\n", xboxPath, hostPath);
+        return;
+    }
+
+    int wlen = MultiByteToWideChar(CP_ACP, 0, hostPath, -1, nullptr, 0);
+    if (wlen <= 1) return;
+    std::wstring wpath(static_cast<size_t>(wlen - 1), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, hostPath, -1, &wpath[0], wlen);
+
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IGraphBuilder* pGraph  = nullptr;
+    IMediaControl* pCtrl   = nullptr;
+    IMediaEventEx* pEvent  = nullptr;
+    IVideoWindow*  pVidWin = nullptr;
+    IBasicVideo*   pBasVid = nullptr;
+    IBasicAudio*   pAudio  = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IGraphBuilder, reinterpret_cast<void**>(&pGraph))) && pGraph) {
+        if (SUCCEEDED(pGraph->RenderFile(wpath.c_str(), nullptr))) {
+            pGraph->QueryInterface(IID_IMediaControl, reinterpret_cast<void**>(&pCtrl));
+            pGraph->QueryInterface(IID_IMediaEventEx, reinterpret_cast<void**>(&pEvent));
+            pGraph->QueryInterface(IID_IVideoWindow,  reinterpret_cast<void**>(&pVidWin));
+            pGraph->QueryInterface(IID_IBasicVideo,   reinterpret_cast<void**>(&pBasVid));
+            pGraph->QueryInterface(IID_IBasicAudio,   reinterpret_cast<void**>(&pAudio));
+
+            // Clear D3D9 backbuffer to pure black for clean 4:3 pillarboxing on 16:9 / 21:9
+            if (d3d9_bridge::IsReady()) {
+                d3d9_bridge::Clear(0, nullptr, 0x000000F0u, 0xFF000000u, 1.0f, 0);
+                d3d9_bridge::Swap(0);
+            }
+
+            long vidW = 640, vidH = 480;
+            if (pBasVid) {
+                long vw = 0, vh = 0;
+                if (SUCCEEDED(pBasVid->GetVideoSize(&vw, &vh)) && vw > 0 && vh > 0) {
+                    vidW = vw; vidH = vh;
+                }
+            }
+
+            RECT lastRc{};
+            auto updateVideoPos = [&]() {
+                if (!pVidWin || !IsWindow(g_hWnd)) return;
+                RECT rc{};
+                GetClientRect(g_hWnd, &rc);
+                if (rc.right == lastRc.right && rc.bottom == lastRc.bottom && lastRc.right > 0) return;
+                lastRc = rc;
+                long cw = rc.right - rc.left;
+                long ch = rc.bottom - rc.top;
+                if (cw <= 0 || ch <= 0) return;
+                // Fit video preserving 4:3 (or native video aspect) centered inside viewport
+                long targetW = cw;
+                long targetH = (cw * vidH) / vidW;
+                if (targetH > ch) {
+                    targetH = ch;
+                    targetW = (ch * vidW) / vidH;
+                }
+                long vx = (cw - targetW) / 2;
+                long vy = (ch - targetH) / 2;
+                // Cover the entire viewport with the DirectShow video window (pure black border)
+                // and place the 4:3 video destination centered inside it so pillarboxes are always jet black!
+                pVidWin->put_BorderColor(RGB(0, 0, 0));
+                pVidWin->SetWindowPosition(0, 0, cw, ch);
+                if (pBasVid) {
+                    pBasVid->SetDestinationPosition(vx, vy, targetW, targetH);
+                } else {
+                    pVidWin->SetWindowPosition(vx, vy, targetW, targetH);
+                }
+            };
+
+            if (pVidWin) {
+                pVidWin->put_Owner(reinterpret_cast<OAHWND>(g_hWnd));
+                pVidWin->put_WindowStyle(WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
+                pVidWin->put_MessageDrain(reinterpret_cast<OAHWND>(g_hWnd));
+                updateVideoPos();
+                pVidWin->put_Visible(OATRUE);
+            }
+
+            auto syncVolume = [&]() {
+                if (!pAudio) return;
+                bool muted = dsound_bridge::IsMuted() ||
+                             (dsound_bridge::IsMuteInBackground() && !IsGameWindowFocused());
+                int vol = muted ? 0 : dsound_bridge::GetMasterVolume();
+                long db = (vol <= 0) ? -10000L : static_cast<long>(2000.0 * std::log10(static_cast<double>(vol) / 100.0));
+                if (db < -10000L) db = -10000L;
+                if (db > 0L)      db = 0L;
+                pAudio->put_Volume(db);
+            };
+            syncVolume();
+
+            if (pCtrl && SUCCEEDED(pCtrl->Run())) {
+                LogPrintf("[Movie_Play] Native DirectShow playback started (%ldx%ld): '%s'\n", vidW, vidH, hostPath);
+                DWORD startTick = GetTickCount();
+                bool prevSkipDown = true; // require fresh press after grace period
+                while (IsWindow(g_hWnd)) {
+                    PumpWin32Messages();
+                    updateVideoPos();
+                    syncVolume();
+
+                    if (pEvent) {
+                        long evCode = 0;
+                        LONG_PTR p1 = 0, p2 = 0;
+                        bool ended = false;
+                        while (SUCCEEDED(pEvent->GetEvent(&evCode, &p1, &p2, 0))) {
+                            pEvent->FreeEventParams(evCode, p1, p2);
+                            if (evCode == EC_COMPLETE || evCode == EC_USERABORT || evCode == EC_ERRORABORT) {
+                                ended = true;
+                            }
+                        }
+                        if (ended) break;
+                    }
+
+                    // Allow skipping any intro/FMV via Space, Enter, Esc, LMB, or Gamepad A/B/Start
+                    bool skipDown = false;
+                    if (IsGameWindowFocused()) {
+                        if ((GetAsyncKeyState(VK_SPACE)  & 0x8000) ||
+                            (GetAsyncKeyState(VK_RETURN) & 0x8000) ||
+                            (GetAsyncKeyState(VK_ESCAPE) & 0x8000) ||
+                            (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+                            skipDown = true;
+                        }
+                        if (!skipDown && g_winXInputGetState) {
+                            WIN_XINPUT_STATE ws{};
+                            if (g_winXInputGetState(g_activeWinPadIndex, &ws) == ERROR_SUCCESS) {
+                                if (ws.Gamepad.wButtons & (0x1000u | 0x2000u | 0x0010u)) { // A, B, Start
+                                    skipDown = true;
+                                }
+                            }
+                        }
+                    }
+                    if (GetTickCount() - startTick > 250) {
+                        if (skipDown && !prevSkipDown && (bSkippable || !bLoop)) {
+                            LogPrintf("[Movie_Play] Skipped by user.\n");
+                            break;
+                        }
+                    }
+                    prevSkipDown = skipDown;
+                    Sleep(10);
+                }
+                pCtrl->Stop();
+            }
+            if (pVidWin) {
+                pVidWin->put_Visible(OAFALSE);
+                pVidWin->put_Owner(0);
+            }
+        } else {
+            LogPrintf("[Movie_Play] DirectShow RenderFile failed for '%s'\n", hostPath);
+        }
+    }
+
+    if (pAudio)  pAudio->Release();
+    if (pBasVid) pBasVid->Release();
+    if (pVidWin) pVidWin->Release();
+    if (pEvent)  pEvent->Release();
+    if (pCtrl)   pCtrl->Release();
+    if (pGraph)  pGraph->Release();
+    if (SUCCEEDED(hrCo)) CoUninitialize();
+}
+
 // TIF_Render_Implement::Movie_Play (0x00297A90)
 static void* __fastcall Detour_Movie_Play(
     void* /*thisPtr*/,
@@ -2309,7 +2559,10 @@ static void* __fastcall Detour_Movie_Play(
     const char* path = reinterpret_cast<GetFilePathFn>(0x002B6730)(pFileName, nullptr, 2);
     LogPrintf("[Movie_Play] Playing '%s' (loop=%d, skippable=%d)\n",
               path ? path : "(unknown)", bLoop ? 1 : 0, bSkippable ? 1 : 0);
-    if (path) g_lastMovieName = path;
+    if (path) {
+        g_lastMovieName = path;
+        PlayXboxMovieWmv(path, bLoop, bSkippable);
+    }
     PumpWin32Messages();
     return nullptr;
 }
@@ -2788,7 +3041,7 @@ bool IsSubtitlesEnabled() {
 }
 
 void SetBuffyCostume(uint32_t costumeId) {
-    g_buffyCostume = (costumeId <= 4) ? costumeId : 0;
+    g_buffyCostume = (costumeId <= 8) ? costumeId : 0;
 }
 
 uint32_t GetBuffyCostume() {
@@ -2888,6 +3141,10 @@ const char* GetQuickStatusText() {
 
 void SetAutoPauseUnfocused(bool enabled) {
     g_autoPauseUnfocused = enabled;
+}
+
+void SetSkipIntroMovies(bool enabled) {
+    g_skipIntroMovies = enabled;
 }
 
 void SetCheats(bool infHealth, bool infPower, bool infAmmoDurability, bool oneHitDust) {
