@@ -15,6 +15,7 @@ Vimm's Lair.txt
 decompile/
 
 # Runtime build output, unpacked cache, saves, dumped/HD textures & local settings
+dist/
 recomp/build/
 recomp/cache/
 recomp/saves/

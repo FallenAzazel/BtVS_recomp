@@ -9,6 +9,26 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
 
 ---
 
+## How to Run (Quick Start)
+
+### Option A — Prebuilt GitHub Release (Easiest, No Visual Studio Required)
+1. Download and unzip the latest `BtVS_recomp_*_win32.zip` from **GitHub Releases**.
+2. Place your legal **Buffy the Vampire Slayer (Europe)** Original Xbox XISO in the unzipped folder and extract it (requires Python 3.10+):
+   ```bash
+   python tools/extract_xiso.py "Buffy the Vampire Slayer (Europe).xiso.iso" extracted
+   ```
+3. Double-click **`Play_Buffy.bat`** — on first launch it unpacks `install.dat` automatically and boots straight into the game!
+
+### Option B — Build from Source
+1. Clone this repository and extract your Xbox XISO into `extracted/` (same command as Step 2 above).
+2. Verify line 8 of `recomp/build_and_run.bat` points to your Visual Studio `vcvars32.bat` path, then run:
+   ```bat
+   recomp\build_and_run.bat
+   ```
+3. *(Optional)* To package a clean prebuilt `.zip` for GitHub Releases, run `tools\package_release.bat [version]`.
+
+---
+
 ## Features & Enhancements
 
 - **Native Win32 Hardware Direct3D 9 Renderer** (`recomp/src/d3d9_bridge.cpp`):
@@ -25,7 +45,7 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
   - **XInput gamepad** + **Keyboard & Mouse-Look Camera** support (with configurable sensitivity, Invert X/Y, deadzone, rumble, and 10 custom remappable keybinds)
   - **5-Slot Quick Saves** (`F5`/`F6`, `Shift+1..5`, or `Game → Quick Save Slots`) with optional **Auto-Resume on Launch**
   - **Chapter / Arena Launcher** (`Game → Jump to Level / Arena`) to jump straight into any of the 13 chapters, 4 arenas, or *Buffy History 101*
-  - **Buffy Costume Swapper** (`Config → General`): swap between *Slayer*, *Cheerleader*, *The Bronze*, and *Workout* outfits in-place at your current position
+  - **Buffy Costume Mods** (`Config → Costume Mods`): swap between all 4 original Xbox outfits (*Slayer*, *Cheerleader*, *The Bronze*, *Workout*) plus **4 included Custom 1024×1024 HD Costumes** (*Red Leather*, *Silver Sequin Club*, *Black Mini Dress*, and *Lilac Wrap & Black Pants*) — swaps instantly in real time between same-mesh outfits or reloads in-place at your exact position!
   - **Cutscene Subtitles** toggle (`Config → General → Show Cutscene Subtitles`) and **Native DirectShow `.wmv` FMV Playback** (plays the original 2002 Fox / EA / Collective intro videos with synced audio, skippable via `Space`/`Enter`/`Click`/Gamepad, with an optional **Skip Intro Logos** toggle)
   - **Borderless Fullscreen (`F11`)** and **Auto-Pause When Unfocused (Alt-Tab)** toggle
   - Modern dark/light-aware Win32 **Configuration UI (`F1`)** including an **About** tab
@@ -38,6 +58,10 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
 ---
 
 ## What's New
+
+### 2026-11-22
+- **Costume Mods Tab & 4 Custom 1024×1024 HD Outfits (`Config → Costume Mods`)**: Moved Buffy's costume selector to its own dedicated **Costume Mods** tab and added 4 included custom HD outfits (*Red Leather*, *Silver Sequin Club*, *Black Mini Dress*, and *Lilac Wrap & Black Pants*) stored in `recomp/hd_textures/costume_*/` (leaving all 4 original Xbox outfits intact, with instant zero-reload swapping between same-mesh costumes and optional local inspiration preview cards).
+- **Updated About Tab**: Embedded the open-source BtVS logo directly into `Config → About` with automatic Dark/Light mode tinting.
 
 ### 2026-11-21
 - **Native `.wmv` FMV Playback & HD Movie Overrides (`recomp/hd_movies/`)**: Plays the original 2002 intro videos (`Logo_Legal`, `Logo_EA`, `Logo_Fox`, `Logo_Collective`) and `attract.wmv` trailer natively via DirectShow with synced audio, jet-black 16:9/21:9 pillarboxing, skippable controls, a **Skip Intro Logos on Launch** toggle in `Config → General`, and automatic `.mp4`/`.wmv`/`.avi` HD overrides in `recomp/hd_movies/`.
@@ -137,6 +161,8 @@ recomp\build_and_run.bat
 ```
 
 On first launch, the runtime automatically unpacks `extracted\install.dat` into `recomp\cache\` (`Z:\`), creates save data in `recomp\saves\` (`T:\` / `U:\`), and launches the game.
+
+> **Prebuilt Releases:** If you downloaded a prebuilt `.zip` from GitHub Releases, just extract your Xbox XISO into `extracted/` (Step 1) and double-click **`Play_Buffy.bat`** — no Visual Studio required! Maintainers can build a clean release `.zip` anytime via `tools\package_release.bat [version]`.
 
 ---
 
