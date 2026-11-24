@@ -127,6 +127,7 @@ static std::atomic<uint32_t> g_reqMsaa{4};
 static std::atomic<uint32_t> g_reqAniso{16};
 static std::atomic<uint32_t> g_reqAspect{0};
 static std::atomic<bool>     g_fogEnabled{true};
+static std::atomic<bool>     g_enhancedDynamicLighting{true};
 static bool                  g_menuPillarbox = false;
 static std::atomic<bool> g_traceRequested{false};
 static bool              g_tracingThisFrame = false;
@@ -140,6 +141,14 @@ void SetFogEnabled(bool enabled) {
 
 bool IsFogEnabled() {
     return g_fogEnabled.load();
+}
+
+void SetEnhancedDynamicLighting(bool enabled) {
+    g_enhancedDynamicLighting.store(enabled);
+}
+
+bool IsEnhancedDynamicLighting() {
+    return g_enhancedDynamicLighting.load();
 }
 
 void SetMenuPillarbox(bool enabled) {
@@ -2160,30 +2169,48 @@ static void SyncXboxStates() {
         const uint32_t* st = ts + s * 32;
         uint32_t colorOp = st[12];
         uint32_t alphaOp = st[16];
-        if (isWaterSurface && s == 2) continue; // Configured by HD Water pass on Stage 1
+        if (isWaterSurface && s >= 2) continue; // Configured by Water pass on Stage 1
         // Disable stages above 0 if no texture is bound and stage uses D3DTA_TEXTURE
         if (s > 0 && !g_boundTexPresent[s] && (colorOp == 0 || colorOp == 1)) {
             g_dev->SetTextureStageState(s, D3DTSS_COLOROP, D3DTOP_DISABLE);
             g_dev->SetTextureStageState(s, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
             continue;
         }
-        // HD Water Polish (fvf=0x242, zWrite=0, Stage 0=animated water, Stage 1=broken 8x8 reflection atlas):
-        // Replace Stage 1's tiled atlas with a counter-scrolling dual-layer copy of Stage 0's own water texture
-        // for authentic interference wave ripples, plus a gentle breathing moonlight/murky teal tint on Stage 2!
+        // Authentic dark translucent water (fvf=0x242, zWrite=0, Stage 0=animated water, Stage 1=reflection/ripple):
+        // Preserve per-vertex shoreline fade alpha (D3DTA_DIFFUSE) modulated with a translucent pond opacity,
+        // and use dark murky MODULATE2X ripples so the ground & Buffy's feet show clearly through the water.
         if (s == 1 && isWaterSurface) {
+            bool enhWater = g_enhancedDynamicLighting.load();
             float tSec = static_cast<float>(GetTickCount() & 0xFFFFFu) * 0.001f;
-            float shimmer = 0.92f + 0.08f * std::sin(tSec * 1.4f);
-            uint32_t r = static_cast<uint32_t>(0x3A * shimmer);
-            uint32_t g = static_cast<uint32_t>(0x50 * shimmer);
-            uint32_t b = static_cast<uint32_t>(0x4A * shimmer);
-            uint32_t waterTint = (0x72u << 24) | ((r & 0xFFu) << 16) | ((g & 0xFFu) << 8) | (b & 0xFFu);
+            // Subtle wind-gust envelope (slowly breathes between calm and breezy ripples)
+            float gust = 0.5f + 0.5f * std::sin(tSec * 0.55f) * std::cos(tSec * 0.23f);
+            float shimmer = 0.90f + (enhWater ? 0.12f : 0.08f) * std::sin(tSec * 1.4f + gust * 1.2f);
+            uint32_t r = static_cast<uint32_t>((enhWater ? 0x26 : 0x24) * shimmer);
+            uint32_t g = static_cast<uint32_t>((enhWater ? 0x38 : 0x34) * shimmer);
+            uint32_t b = static_cast<uint32_t>((enhWater ? 0x42 : 0x3C) * shimmer);
+            uint32_t waterTint = (0x54u << 24) | ((r & 0xFFu) << 16) | ((g & 0xFFu) << 8) | (b & 0xFFu);
 
             g_dev->SetRenderState(D3DRS_TEXTUREFACTOR, waterTint);
-            g_dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-            g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+            g_dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
+            g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            g_dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
 
             if (g_boundTexPtr[0]) {
-                // Stage 1: counter-scrolling 1.35x ripple interference layer using Stage 0's water texture
+                if (enhWater) {
+                    // Stage 0: primary wind-blown swell (slightly angled + gusting drift)
+                    D3DMATRIX w0{};
+                    float sc0 = 1.15f + 0.03f * std::sin(tSec * 0.9f);
+                    float c0 = 0.9781f * sc0, s0 = 0.2079f * sc0; // ~12 deg wind angle
+                    w0._11 =  c0; w0._12 = s0;
+                    w0._21 = -s0; w0._22 = c0;
+                    w0._33 = 1.0f; w0._44 = 1.0f;
+                    w0._31 = std::fmod(tSec * 0.022f + 0.008f * std::sin(tSec * 0.7f), 1.0f);
+                    w0._32 = std::fmod(tSec * 0.014f + 0.006f * std::cos(tSec * 0.55f), 1.0f);
+                    g_dev->SetTransform(D3DTS_TEXTURE0, &w0);
+                    g_dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+                }
+
+                // Stage 1: cross-angled wind ripple interference layer (MODULATE2X keeps dark murky depth!)
                 g_dev->SetTexture(1, g_boundTexPtr[0]);
                 g_dev->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
                 g_dev->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
@@ -2191,30 +2218,73 @@ static void SyncXboxStates() {
                 g_dev->SetSamplerState(1, D3DSAMP_MINFILTER, (g_maxAniso > 1) ? D3DTEXF_ANISOTROPIC : D3DTEXF_LINEAR);
                 g_dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
                 D3DMATRIX wMat{};
-                wMat._11 = 1.35f; wMat._22 = 1.35f; wMat._33 = 1.0f; wMat._44 = 1.0f;
-                wMat._31 = std::fmod(tSec * 0.032f, 1.0f);
-                wMat._32 = std::fmod(-tSec * 0.024f, 1.0f);
+                if (enhWater) {
+                    // ~38 deg counter-rotated higher-frequency wind ripples creating organic diamond wavelets
+                    float sc1 = 1.72f + 0.05f * std::cos(tSec * 1.3f);
+                    float c1 = 0.7880f * sc1, s1 = -0.6157f * sc1;
+                    wMat._11 =  c1; wMat._12 = s1;
+                    wMat._21 = -s1; wMat._22 = c1;
+                    wMat._33 = 1.0f; wMat._44 = 1.0f;
+                    wMat._31 = std::fmod(-tSec * 0.038f + 0.011f * std::sin(tSec * 1.25f), 1.0f);
+                    wMat._32 = std::fmod( tSec * 0.029f + 0.009f * std::cos(tSec * 0.95f), 1.0f);
+                } else {
+                    wMat._11 = 1.35f; wMat._22 = 1.35f; wMat._33 = 1.0f; wMat._44 = 1.0f;
+                    wMat._31 = std::fmod(tSec * 0.025f, 1.0f);
+                    wMat._32 = std::fmod(-tSec * 0.018f, 1.0f);
+                }
                 g_dev->SetTransform(D3DTS_TEXTURE1, &wMat);
                 g_dev->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 0);
                 g_dev->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-                g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_ADDSMOOTH);
+                g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_MODULATE2X);
                 g_dev->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
                 g_dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
                 g_dev->SetTextureStageState(1, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
                 g_dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
 
-                // Stage 2: murky green-teal atmospheric tint & specular shimmer
+                // Stage 2: deep murky moonlit pond tint
                 g_dev->SetTextureStageState(2, D3DTSS_COLOROP,   D3DTOP_MODULATE);
                 g_dev->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
                 g_dev->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TFACTOR);
                 g_dev->SetTextureStageState(2, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
                 g_dev->SetTextureStageState(2, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+
+                // Stage 3: Enhanced Dynamic Lighting ON -> live camera-space reflections dancing with wind ripples
+                // (CURRENT.rgb + CURRENT.a * Reflection.rgb, so reflections glide with camera & fade at shoreline!)
+                if (enhWater) {
+                    IDirect3DBaseTexture9* reflTex = g_boundTexPtr[1] ? g_boundTexPtr[1] : g_boundTexPtr[0];
+                    g_dev->SetTexture(3, reflTex);
+                    g_dev->SetSamplerState(3, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                    g_dev->SetSamplerState(3, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                    g_dev->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                    g_dev->SetSamplerState(3, D3DSAMP_MINFILTER, (g_maxAniso > 1) ? D3DTEXF_ANISOTROPIC : D3DTEXF_LINEAR);
+                    g_dev->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                    D3DMATRIX rMat{};
+                    float rScale = 0.0025f + 0.00018f * std::sin(tSec * 1.9f);
+                    rMat._11 = rScale; rMat._32 = rScale; rMat._44 = 1.0f;
+                    rMat._41 = 0.5f + 0.018f * std::sin(tSec * 2.2f) + 0.010f * std::cos(tSec * 1.1f);
+                    rMat._42 = 0.5f + 0.016f * std::cos(tSec * 1.8f) + 0.010f * std::sin(tSec * 0.85f);
+                    g_dev->SetTransform(D3DTS_TEXTURE3, &rMat);
+                    g_dev->SetTextureStageState(3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+                    g_dev->SetTextureStageState(3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+                    g_dev->SetTextureStageState(3, D3DTSS_COLOROP,   D3DTOP_MODULATEALPHA_ADDCOLOR);
+                    g_dev->SetTextureStageState(3, D3DTSS_COLORARG1, D3DTA_CURRENT);
+                    g_dev->SetTextureStageState(3, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+                    g_dev->SetTextureStageState(3, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+                    g_dev->SetTextureStageState(3, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+                } else {
+                    g_dev->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
+                    g_dev->SetTextureStageState(3, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+                }
             } else {
                 g_dev->SetTextureStageState(1, D3DTSS_COLOROP,   D3DTOP_MODULATE);
                 g_dev->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
                 g_dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
                 g_dev->SetTextureStageState(1, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
                 g_dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+                g_dev->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE);
+                g_dev->SetTextureStageState(2, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+                g_dev->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
+                g_dev->SetTextureStageState(3, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
             }
             continue;
         }
@@ -2264,9 +2334,10 @@ static void SyncXboxStates() {
         }
 
         // Boost 3D additive particle/sparkle glows (fvf=0x142, DESTBLEND=ONE, MODULATE -> MODULATE2X)
-        // to restore the vivid Xbox CRT/gamma-lifted luminescence on item halos, slayer sparkles & flames.
+        // when Enhanced Dynamic Lighting is ON; when OFF, keep original 1x MODULATE glow intensity.
         DWORD resolvedColorOp = colorOp ? MapXboxTextureOp(colorOp) : (s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE);
-        if (s == 0 && !is2D && g_fvf == 0x142 && isAdditive && resolvedColorOp == D3DTOP_MODULATE) {
+        if (s == 0 && !is2D && g_fvf == 0x142 && isAdditive && resolvedColorOp == D3DTOP_MODULATE &&
+            g_enhancedDynamicLighting.load()) {
             resolvedColorOp = D3DTOP_MODULATE2X;
         }
         g_dev->SetTextureStageState(s, D3DTSS_COLOROP,   resolvedColorOp);
@@ -2594,6 +2665,7 @@ void DrawIndexedVertices(uint32_t xboxPrimType, uint32_t vertexCount, const void
     // Slate Engine creates a multi-stream FVF declaration via Precache_Shader(-1, decl):
     //   Stream 0: float3 Position, Stream 1: float3 TexCoord0, [Stream 2: float3 TexCoord1]
     if (g_customVS && (g_boundTexVol[0] || g_boundTexVol[1])) {
+        if (!g_enhancedDynamicLighting.load()) return;
         EnsureSceneBegun();
         SyncXboxStates();
 

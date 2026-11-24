@@ -63,8 +63,9 @@ static void LoadSettingsIni() {
     g_cfg.aniso               = GetPrivateProfileIntA("Graphics", "Anisotropic",         16,        g_settingsIniPath.c_str());
     g_cfg.aspectMode          = GetPrivateProfileIntA("Graphics", "AspectMode",          defAspect, g_settingsIniPath.c_str());
     g_cfg.targetFps           = GetPrivateProfileIntA("Graphics", "TargetFPS",           60,        g_settingsIniPath.c_str());
-    g_cfg.atmosphericFog      = GetPrivateProfileIntA("Graphics", "AtmosphericFog",      1,         g_settingsIniPath.c_str()) != 0;
-    g_cfg.softBloom           = GetPrivateProfileIntA("Graphics", "SoftBloom",           0,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.atmosphericFog          = GetPrivateProfileIntA("Graphics", "AtmosphericFog",          1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.enhancedDynamicLighting = GetPrivateProfileIntA("Graphics", "EnhancedDynamicLighting", 1,         g_settingsIniPath.c_str()) != 0;
+    g_cfg.softBloom               = GetPrivateProfileIntA("Graphics", "SoftBloom",               0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.cinemaVignette      = GetPrivateProfileIntA("Graphics", "CinemaVignette",      0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.crtScanlines        = GetPrivateProfileIntA("Graphics", "CrtScanlines",        0,         g_settingsIniPath.c_str()) != 0;
     g_cfg.sharpnessPercent    = GetPrivateProfileIntA("Graphics", "Sharpness",           35,        g_settingsIniPath.c_str());
@@ -132,8 +133,9 @@ static void SaveSettingsIni() {
     writeU("Graphics", "Anisotropic",         static_cast<int>(g_cfg.aniso));
     writeU("Graphics", "AspectMode",          static_cast<int>(g_cfg.aspectMode));
     writeU("Graphics", "TargetFPS",           static_cast<int>(g_cfg.targetFps));
-    writeU("Graphics", "AtmosphericFog",      g_cfg.atmosphericFog ? 1 : 0);
-    writeU("Graphics", "SoftBloom",           g_cfg.softBloom ? 1 : 0);
+    writeU("Graphics", "AtmosphericFog",          g_cfg.atmosphericFog ? 1 : 0);
+    writeU("Graphics", "EnhancedDynamicLighting", g_cfg.enhancedDynamicLighting ? 1 : 0);
+    writeU("Graphics", "SoftBloom",               g_cfg.softBloom ? 1 : 0);
     writeU("Graphics", "CinemaVignette",      g_cfg.cinemaVignette ? 1 : 0);
     writeU("Graphics", "CrtScanlines",        g_cfg.crtScanlines ? 1 : 0);
     writeU("Graphics", "Sharpness",           g_cfg.sharpnessPercent);
@@ -177,6 +179,7 @@ static void ApplyAllConfig(const config_ui::AppConfig& cfg, bool relayout) {
     g_cfg = cfg;
     d3d9_bridge::RequestGraphicsSettings(g_cfg.resScale, g_cfg.msaa, g_cfg.aniso, g_cfg.aspectMode);
     d3d9_bridge::SetFogEnabled(g_cfg.atmosphericFog);
+    d3d9_bridge::SetEnhancedDynamicLighting(g_cfg.enhancedDynamicLighting);
     d3d9_bridge::SetBloomEnabled(g_cfg.softBloom);
     d3d9_bridge::SetSharpnessPercent(g_cfg.sharpnessPercent);
     d3d9_bridge::SetPostEffects(g_cfg.cinemaVignette, g_cfg.crtScanlines);
