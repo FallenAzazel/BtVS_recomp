@@ -877,6 +877,7 @@ static void RebuildConfigControls(int w, int h) {
         addDropdown(205, "Anisotropic Filtering:", afStr);
         y += 2;
         addToggle(206, "Atmospheric Distance Fog", g_cfg->atmosphericFog);
+        addToggle(215, "Enhanced Dynamic Lighting (Glows / Fire)", g_cfg->enhancedDynamicLighting);
         addToggle(210, "Subtle Soft Bloom (Lanterns / Magic)", g_cfg->softBloom);
         addToggle(213, "Cinema Vignette (Gothic Edge Darkening)", g_cfg->cinemaVignette);
         addToggle(214, "Retro 480p CRT Scanlines", g_cfg->crtScanlines);
@@ -1177,6 +1178,7 @@ static LRESULT CALLBACK ConfigDlgWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                         else if (c.id == 102) g_cfg->hideMouseInactivity = !g_cfg->hideMouseInactivity;
                         else if (c.id == 103) { g_cfg->showStatusBar = !g_cfg->showStatusBar; relayout = true; }
                         else if (c.id == 206) g_cfg->atmosphericFog = !g_cfg->atmosphericFog;
+                        else if (c.id == 215) g_cfg->enhancedDynamicLighting = !g_cfg->enhancedDynamicLighting;
                         else if (c.id == 210) g_cfg->softBloom = !g_cfg->softBloom;
                         else if (c.id == 213) g_cfg->cinemaVignette = !g_cfg->cinemaVignette;
                         else if (c.id == 214) g_cfg->crtScanlines = !g_cfg->crtScanlines;
@@ -1493,7 +1495,7 @@ void OpenConfigDialog(HWND hOwner, AppConfig* cfg, const Callbacks* cb, int init
         reg = true;
     }
 
-    int dw = 740, dh = 725;
+    int dw = 740, dh = 765;
     RECT rcOwner{};
     int px = CW_USEDEFAULT, py = CW_USEDEFAULT;
     if (hOwner && GetWindowRect(hOwner, &rcOwner)) {

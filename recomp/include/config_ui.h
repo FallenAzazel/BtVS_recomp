@@ -25,8 +25,9 @@ struct AppConfig {
     uint32_t targetFps           = 60;   // 30, 60, 120, 165, 0=Uncapped
     uint32_t msaa                = 4;    // 0, 2, 4
     uint32_t aniso               = 16;   // 1, 4, 8, 16
-    bool     atmosphericFog      = true;
-    bool     softBloom           = false;
+    bool     atmosphericFog          = true;
+    bool     enhancedDynamicLighting = true;
+    bool     softBloom               = false;
     bool     cinemaVignette      = false;
     bool     crtScanlines        = false;
     int      sharpnessPercent    = 35;   // 0..100 (CAS contrast-adaptive sharpening)

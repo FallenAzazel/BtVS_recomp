@@ -17,6 +17,7 @@ decompile/
 # Runtime build output, unpacked cache, saves, dumped/HD textures & local settings
 dist/
 recomp/build/
+uwp_recomp/
 recomp/cache/
 recomp/saves/
 recomp/dump_textures/

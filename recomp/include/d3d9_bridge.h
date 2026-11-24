@@ -30,6 +30,8 @@ uint32_t GetOutputWidth();
 uint32_t GetOutputHeight();
 void SetFogEnabled(bool enabled);
 bool IsFogEnabled();
+void SetEnhancedDynamicLighting(bool enabled);
+bool IsEnhancedDynamicLighting();
 void SetBloomEnabled(bool enabled);
 bool IsBloomEnabled();
 void SetSharpnessPercent(int sharpnessPercent);
