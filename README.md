@@ -29,6 +29,12 @@ A native Windows x86 in-process execution runtime, hardware Direct3D 9 renderer,
    ```
 3. *(Optional)* To package a clean prebuilt `.zip` for GitHub Releases, run `tools\package_release.bat [version]`.
 
+### Option C — Portable 64-bit Direct3D 11 / UWP Static Recomp (`uwp_recomp/`, PC x64 & Xbox Dev Mode)
+A full **64-bit (`x64`) Direct3D 11 + XAudio2 + Media Foundation** static recompilation designed for **Windows x64** (up to 4K / 21:9 ultrawide, uncapped high-refresh-rate FPS, aspect-correct HUD, full 3D audio + WMA music) and **Xbox Series X|S / Xbox One Dev Mode (UWP)**:
+1. Extract your Xbox XISO into `extracted/` (same as above) and install `capstone` (`pip install capstone`).
+2. Run `uwp_recomp\build_and_run_x64.bat` (lifts `Default.xbe` locally, compiles `BtVSRecompUWP.exe`, and launches).
+3. See **[`uwp_recomp/README.md`](uwp_recomp/README.md)** for full **PC x64** and **Xbox Series X|S Dev Mode (`.msix` / Device Portal)** packaging & deployment instructions.
+
 ---
 
 ## Features & Enhancements
