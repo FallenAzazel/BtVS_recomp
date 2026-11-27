@@ -11,6 +11,9 @@ struct UwpConfig {
     bool     widescreenHorPlus   = true;
     bool     enhancedLighting    = true;
     int      ambientLevel        = 1;     // 0=Low(0.25), 1=Balanced(0.48), 2=Bright(0.65)
+    bool     ssao                = true;
+    bool     hdrBloom            = true;
+    bool     charRimSpec         = true;
     bool     vsync               = true;
     bool     showFps             = false;
 };

@@ -705,7 +705,15 @@ void RegisterAll() {
             CoUninitialize();
             return tc.eax;
         }, ta, 0, nullptr);
+        uint32_t gh = 0xDEAD0000u | tid;
         if (h) {
+            // Expose a duplicated thread HANDLE in g_fileHandles so WaitForSingleObject(hThread, INFINITE)
+            // genuinely joins audio/music worker threads before the main thread frees CMusicBufferDS!
+            HANDLE hGuest = nullptr;
+            if (DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &hGuest, 0, FALSE, DUPLICATE_SAME_ACCESS) && hGuest) {
+                std::lock_guard<std::mutex> lk(g_vfsMtx);
+                g_fileHandles[gh] = hGuest;
+            }
             std::lock_guard<std::mutex> lk(g_workerMtx);
             // Prune already-exited worker handles before pushing
             g_workerHandles.erase(
@@ -716,7 +724,7 @@ void RegisterAll() {
                 g_workerHandles.end());
             g_workerHandles.push_back(h);
         }
-        c.eax = 0xDEAD0000u | tid;
+        c.eax = gh;
         RetStdcall(c, 24);
     });
     RegisterGuestFunc(0x005770DBu, [](X86Context& c) { c.eax = 1u; RetStdcall(c, 20); }); // _timeSetEvent@20
@@ -1260,7 +1268,77 @@ void RegisterAll() {
         c.eax = 0u;
         RetStdcall(c, 20);
     });
-    RegisterGuestFunc(0x005A697Bu, [](X86Context& c) { RetStdcall(c, 40); }); // _XGSwizzleBox@40
+    RegisterGuestFunc(0x005A697Bu, [](X86Context& c) { // _XGSwizzleBox@40(pSrc, rowPitch, slicePitch, pBox, pDst, w, h, d, pPt, bpp)
+        uint32_t pSrcVA = Arg(c, 1);
+        uint32_t rowPitch = Arg(c, 2);
+        uint32_t slicePitch = Arg(c, 3);
+        uint32_t pBoxVA = Arg(c, 4);
+        uint32_t pDstVA = Arg(c, 5);
+        uint32_t w = Arg(c, 6), h = Arg(c, 7), d = Arg(c, 8);
+        uint32_t pPtVA = Arg(c, 9);
+        uint32_t bpp = Arg(c, 10);
+        if (pSrcVA && pDstVA && w > 0 && h > 0 && d > 0 && bpp > 0 && bpp <= 16 && w <= 256 && h <= 256 && d <= 256 &&
+            (w & (w - 1u)) == 0u && (h & (h - 1u)) == 0u && (d & (d - 1u)) == 0u) {
+            uint32_t bx0 = 0, by0 = 0, bz0 = 0, bx1 = w, by1 = h, bz1 = d;
+            if (pBoxVA) {
+                bx0 = c.r32(pBoxVA + 0);  by0 = c.r32(pBoxVA + 4);
+                bx1 = c.r32(pBoxVA + 8);  by1 = c.r32(pBoxVA + 12);
+                bz0 = c.r32(pBoxVA + 16); bz1 = c.r32(pBoxVA + 20);
+            }
+            uint32_t ox = 0, oy = 0, oz = 0;
+            if (pPtVA) {
+                ox = c.r32(pPtVA + 0); oy = c.r32(pPtVA + 4); oz = c.r32(pPtVA + 8);
+            }
+            uint32_t subW = (bx1 > bx0) ? (bx1 - bx0) : w;
+            uint32_t subH = (by1 > by0) ? (by1 - by0) : h;
+            uint32_t subD = (bz1 > bz0) ? (bz1 - bz0) : d;
+            if (rowPitch == 0) rowPitch = subW * bpp;
+            if (slicePitch == 0) slicePitch = rowPitch * subH;
+            size_t maxDstBytes = static_cast<size_t>(w) * h * d * bpp;
+
+            uint32_t maskU = 0, maskV = 0, maskW = 0, j = 1;
+            uint32_t tw = w, th = h, td = d;
+            while (tw > 1 || th > 1 || td > 1) {
+                if (tw > 1) { maskU |= j; j <<= 1; tw >>= 1; }
+                if (th > 1) { maskV |= j; j <<= 1; th >>= 1; }
+                if (td > 1) { maskW |= j; j <<= 1; td >>= 1; }
+            }
+            auto expandBits = [](uint32_t val, uint32_t mask) -> uint32_t {
+                uint32_t res = 0, bit = 1;
+                for (uint32_t m = 1; m <= mask && m != 0; m <<= 1) {
+                    if (mask & m) {
+                        if (val & bit) res |= m;
+                        bit <<= 1;
+                    }
+                }
+                return res;
+            };
+            std::vector<uint8_t> srcCopy;
+            const uint8_t* srcPtr = c.ptr(pSrcVA);
+            uint8_t* dstPtr = c.ptr(pDstVA);
+            if (pSrcVA == pDstVA) {
+                size_t copyBytes = std::min<size_t>(maxDstBytes, static_cast<size_t>(slicePitch) * subD);
+                srcCopy.assign(srcPtr, srcPtr + copyBytes);
+                srcPtr = srcCopy.data();
+            }
+            for (uint32_t z = 0; z < subD && (oz + z) < d; ++z) {
+                uint32_t sw = expandBits(oz + z, maskW);
+                for (uint32_t y = 0; y < subH && (oy + y) < h; ++y) {
+                    uint32_t sv = expandBits(oy + y, maskV);
+                    const uint8_t* sRow = srcPtr + static_cast<size_t>(z) * slicePitch + static_cast<size_t>(y) * rowPitch;
+                    for (uint32_t x = 0; x < subW && (ox + x) < w; ++x) {
+                        uint32_t su = expandBits(ox + x, maskU);
+                        size_t dstOff = static_cast<size_t>(su | sv | sw) * bpp;
+                        if (dstOff + bpp <= maxDstBytes) {
+                            std::memcpy(dstPtr + dstOff, sRow + static_cast<size_t>(x) * bpp, bpp);
+                        }
+                    }
+                }
+            }
+            d3d11_bridge::InvalidateTexture(pDstVA);
+        }
+        RetStdcall(c, 40);
+    });
     RegisterGuestFunc(0x005927A0u, [](X86Context& c) { // _D3DDevice_CreateCubeTexture@24(edge, lvls, usage, fmt, pool, ppCube)
         uint32_t edge = Arg(c, 1), fmt = Arg(c, 4), ppCube = Arg(c, 6);
         uint32_t hdrVA = GuestHeapAlloc(32u, 16u);
@@ -2335,7 +2413,7 @@ void RegisterAll() {
             return;
         }
         float targetAspect = 4.0f / 3.0f;
-        if (d3d11_bridge::GetWidescreenHorPlus()) {
+        if (d3d11_bridge::GetWidescreenHorPlus() && vpW > 160u) {
             uint32_t w = d3d11_bridge::GetWidth(), h = d3d11_bridge::GetHeight();
             if (w > 0 && h > 0) {
                 float a = static_cast<float>(w) / static_cast<float>(h);
