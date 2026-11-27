@@ -19,6 +19,9 @@ bool GetWidescreenHorPlus();
 void SetEnhancedLighting(bool enabled);
 void SetCharAmbient(float val);
 void SetVsyncEnabled(bool enabled);
+void SetSsaoEnabled(bool enabled);
+void SetHdrBloomEnabled(bool enabled);
+void SetCharRimSpecEnabled(bool enabled);
 
 // Lightweight UWP-safe 2D overlay drawing (640x480 virtual coordinates, auto-scaled to any resolution)
 void DrawOverlayRect(float x, float y, float w, float h, uint32_t argb);

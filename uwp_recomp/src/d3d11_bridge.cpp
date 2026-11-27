@@ -63,6 +63,41 @@ static IDXGISwapChain1 *g_swapChain = nullptr;
 static bool g_allowTearing = false;
 static ID3D11RenderTargetView *g_rtv = nullptr;
 static ID3D11DepthStencilView *g_dsv = nullptr;
+static ID3D11ShaderResourceView *g_depthSrv = nullptr;
+static ID3D11Texture2D *g_sceneTex = nullptr;
+static ID3D11RenderTargetView *g_sceneRtv = nullptr;
+static ID3D11ShaderResourceView *g_sceneSrv = nullptr;
+static ID3D11Texture2D *g_ssaoTex = nullptr;
+static ID3D11RenderTargetView *g_ssaoRtv = nullptr;
+static ID3D11ShaderResourceView *g_ssaoSrv = nullptr;
+static ID3D11Texture2D *g_bloomATex = nullptr;
+static ID3D11RenderTargetView *g_bloomARtv = nullptr;
+static ID3D11ShaderResourceView *g_bloomASrv = nullptr;
+static ID3D11Texture2D *g_bloomBTex = nullptr;
+static ID3D11RenderTargetView *g_bloomBRtv = nullptr;
+static ID3D11ShaderResourceView *g_bloomBSrv = nullptr;
+static uint32_t g_ssaoW = 1, g_ssaoH = 1;
+static uint32_t g_bloomW = 1, g_bloomH = 1;
+static ID3D11VertexShader *g_vsPost = nullptr;
+static ID3D11PixelShader *g_psSsao = nullptr;
+static ID3D11PixelShader *g_psBloomExtract = nullptr;
+static ID3D11PixelShader *g_psBloomBlur = nullptr;
+static ID3D11PixelShader *g_psComposite = nullptr;
+static ID3D11Buffer *g_cbPost = nullptr;
+static ID3D11SamplerState *g_sampLinearClamp = nullptr;
+static ID3D11SamplerState *g_sampPointClamp = nullptr;
+static ID3D11SamplerState *g_sampVolBorder = nullptr;
+static bool g_sceneHas3D = false;
+static bool g_postResolved = false;
+static bool g_boundToSceneRt = false;
+static float g_last3DProj[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
+struct alignas(16) CbPost {
+  float invRes[4];     // x=1/w, y=1/h, z=1/ssaoW, w=1/ssaoH
+  float projParams[4]; // x=m0, y=m5, z=m10, w=m14
+  float projExtra[4];  // x=m11, y=m15, z=ssaoEnabled(0/1), w=bloomEnabled(0/1)
+  float blurDir[4];    // x=dx, y=dy, z=threshold, w=bloomIntensity
+};
 static ID3D11VertexShader *g_vs = nullptr;
 static ID3D11PixelShader *g_ps = nullptr;
 static ID3D11InputLayout *g_layout = nullptr;
@@ -193,18 +228,20 @@ static D3D11_TEXTURE_ADDRESS_MODE MapXboxAddr11(uint32_t v) {
   }
 }
 
-static ID3D11SamplerState *GetXboxSampler(uint32_t addrU, uint32_t addrV) {
-  uint32_t key = ((addrU & 0xFu) << 4) | (addrV & 0xFu);
+static ID3D11SamplerState *GetXboxSampler(uint32_t addrU, uint32_t addrV,
+                                          uint32_t addrW = 3u, bool isVol = false) {
+  uint32_t key = ((addrU & 0xFu) << 8) | ((addrV & 0xFu) << 4) | (addrW & 0xFu) | (isVol ? 0x1000u : 0u);
   auto it = g_samplerCache.find(key);
   if (it != g_samplerCache.end())
     return it->second;
   D3D11_SAMPLER_DESC sd{};
-  sd.Filter = D3D11_FILTER_ANISOTROPIC;
+  sd.Filter = isVol ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_ANISOTROPIC;
   sd.AddressU = MapXboxAddr11(addrU);
   sd.AddressV = MapXboxAddr11(addrV);
-  sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-  sd.MaxAnisotropy = 16;
+  sd.AddressW = MapXboxAddr11(addrW);
+  sd.MaxAnisotropy = isVol ? 1 : 16;
   sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 0.0f;
   sd.MaxLOD = D3D11_FLOAT32_MAX;
   ID3D11SamplerState *ss = nullptr;
   if (SUCCEEDED(g_dev->CreateSamplerState(&sd, &ss)) && ss) {
@@ -322,8 +359,9 @@ static bool InitShadersAndStates() {
       "        o.pos = p;\n"
       "    }\n"
       "    o.col = i.col;\n"
-      "    float3 u0s = float3(i.uv.xy  * uvScale.xy, i.uv.z);\n"
-      "    float3 u1s = float3(i.uv1.xy * uvScale.zw, i.uv1.z);\n"
+      "    int tciFlags = (int)(alphaParams.w + 0.5f);\n"
+      "    float3 u0s = ((tciFlags & 1) != 0) ? o.viewPos : float3(i.uv.xy  * uvScale.xy, i.uv.z);\n"
+      "    float3 u1s = ((tciFlags & 2) != 0) ? o.viewPos : float3(i.uv1.xy * uvScale.zw, i.uv1.z);\n"
       "    o.uv  = mul(float4(u0s, 1.0f), mTex0).xyz;\n"
       "    o.uv1 = mul(float4(u1s, 1.0f), mTex1).xyz;\n"
       "    return o;\n"
@@ -407,6 +445,35 @@ static bool InitShadersAndStates() {
       "        else                          c.rgb *= tex1.rgb;\n"
       "    }\n"
       "    if (tssMode.z > 0.0f && c.a < tssMode.z) discard;\n"
+      "    if ((alphaParams.y > 0.001f || alphaParams.z > 0.001f) && screenParams.z < 0.5f) {\n"
+      "        float3 dpX = ddx(i.viewPos);\n"
+      "        float3 dpY = ddy(i.viewPos);\n"
+      "        float3 rawN = cross(dpX, dpY);\n"
+      "        float nLen = length(rawN);\n"
+      "        if (nLen > 1e-6f) {\n"
+      "            float3 N = rawN / nLen;\n"
+      "            float3 V = normalize(-i.viewPos);\n"
+      "            if (dot(N, V) < 0.0f) N = -N;\n"
+      "            float luma = dot(c.rgb, float3(0.299f, 0.587f, 0.114f));\n"
+      "            if (alphaParams.y > 0.001f) {\n"
+      "                float ndotv = saturate(dot(N, V));\n"
+      "                float rim = pow(1.0f - ndotv, 3.0f);\n"
+      "                float upMask = saturate(N.y * 0.5f + 0.65f);\n"
+      "                float3 rimTint = float3(0.58f, 0.70f, 0.95f) * (0.35f + 0.65f * saturate(luma));\n"
+      "                c.rgb += rim * upMask * alphaParams.y * rimTint;\n"
+      "            }\n"
+      "            if (alphaParams.z > 0.001f) {\n"
+      "                float3 bx = normalize(dpX + 1e-6f);\n"
+      "                float3 by = normalize(dpY + 1e-6f);\n"
+      "                float3 Nb = normalize(N - (ddx(luma) * bx + ddy(luma) * by) * 1.4f);\n"
+      "                float3 L = normalize(float3(0.32f, 0.72f, -0.61f));\n"
+      "                float3 H = normalize(L + V);\n"
+      "                float spec = pow(saturate(dot(Nb, H)), 26.0f);\n"
+      "                float specMask = smoothstep(0.10f, 0.85f, luma);\n"
+      "                c.rgb += spec * specMask * alphaParams.z * float3(1.0f, 0.96f, 0.90f);\n"
+      "            }\n"
+      "        }\n"
+      "    }\n"
       "    if (fogColor.a > 0.5f) {\n"
       "        float denom = max(fogParams.y - fogParams.x, 1.0f);\n"
       "        float f = saturate((fogParams.y - i.viewPos.z) / denom);\n"
@@ -522,20 +589,237 @@ static bool InitShadersAndStates() {
   g_dev->CreateRasterizerState(&rsd, &g_rsCullCW);
   rsd.CullMode = D3D11_CULL_BACK; // Xbox CULLMODE_CCW (0x901)
   g_dev->CreateRasterizerState(&rsd, &g_rsCullCCW);
+
+  // Post-processing shaders (Fullscreen VS, SSAO, HDR Bloom Extract/Blur, Composite + Tone Map)
+  static const char *kPostHlsl =
+      "cbuffer CbPost : register(b0) {\n"
+      "    float4 invRes;\n"
+      "    float4 projParams;\n"
+      "    float4 projExtra;\n"
+      "    float4 blurDir;\n"
+      "};\n"
+      "Texture2D t0 : register(t0);\n"
+      "Texture2D t1 : register(t1);\n"
+      "Texture2D t2 : register(t2);\n"
+      "Texture2D t3 : register(t3);\n"
+      "SamplerState sLin : register(s0);\n"
+      "SamplerState sPnt : register(s1);\n"
+      "struct PostVSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+      "PostVSOut VSPost(uint id : SV_VertexID) {\n"
+      "    PostVSOut o;\n"
+      "    float2 uv = float2((id << 1) & 2, id & 2);\n"
+      "    o.uv = uv;\n"
+      "    o.pos = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);\n"
+      "    return o;\n"
+      "}\n"
+      "float LinearViewZ(float d) {\n"
+      "    float denom = d * projExtra.x - projParams.z;\n"
+      "    if (abs(denom) < 1e-6f) denom = (denom >= 0.0f) ? 1e-6f : -1e-6f;\n"
+      "    return abs((projParams.w - d * projExtra.y) / denom);\n"
+      "}\n"
+      "float3 ReconstructViewPos(float2 uv, float d) {\n"
+      "    float z = LinearViewZ(d);\n"
+      "    float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);\n"
+      "    float m0 = (abs(projParams.x) > 1e-4f) ? projParams.x : 1.0f;\n"
+      "    float m5 = (abs(projParams.y) > 1e-4f) ? projParams.y : 1.0f;\n"
+      "    return float3(ndc.x * z / m0, ndc.y * z / m5, z);\n"
+      "}\n"
+      "float4 PSSsao(PostVSOut i) : SV_TARGET {\n"
+      "    float d = t0.SampleLevel(sPnt, i.uv, 0).r;\n"
+      "    if (d >= 0.9998f || d <= 0.0001f) return float4(1, 1, 1, 1);\n"
+      "    float3 P = ReconstructViewPos(i.uv, d);\n"
+      "    float2 st = invRes.zw;\n"
+      "    float dR = t0.SampleLevel(sPnt, i.uv + float2(st.x, 0.0f), 0).r;\n"
+      "    float dL = t0.SampleLevel(sPnt, i.uv - float2(st.x, 0.0f), 0).r;\n"
+      "    float dU = t0.SampleLevel(sPnt, i.uv - float2(0.0f, st.y), 0).r;\n"
+      "    float dD = t0.SampleLevel(sPnt, i.uv + float2(0.0f, st.y), 0).r;\n"
+      "    float3 Px = (abs(dR - d) < abs(dL - d)) ? (ReconstructViewPos(i.uv + float2(st.x, 0.0f), dR) - P)\n"
+      "                                            : (P - ReconstructViewPos(i.uv - float2(st.x, 0.0f), dL));\n"
+      "    float3 Py = (abs(dD - d) < abs(dU - d)) ? (ReconstructViewPos(i.uv + float2(0.0f, st.y), dD) - P)\n"
+      "                                            : (P - ReconstructViewPos(i.uv - float2(0.0f, st.y), dU));\n"
+      "    float3 rawN = cross(Px, Py);\n"
+      "    float nLen = length(rawN);\n"
+      "    if (nLen < 1e-6f) return float4(1, 1, 1, 1);\n"
+      "    float3 N = rawN / nLen;\n"
+      "    if (dot(N, -P) < 0.0f) N = -N;\n"
+      "    float aspect = invRes.x / max(invRes.y, 1e-6f);\n"
+      "    float radY = 0.016f;\n"
+      "    float2 radUv = float2(radY * aspect, radY);\n"
+      "    float worldRad = P.z * radY * 2.0f / max(abs(projParams.y), 0.1f);\n"
+      "    static const float kBayer16[16] = {\n"
+      "         0.0f,  8.0f,  2.0f, 10.0f,\n"
+      "        12.0f,  4.0f, 14.0f,  6.0f,\n"
+      "         3.0f, 11.0f,  1.0f,  9.0f,\n"
+      "        15.0f,  7.0f, 13.0f,  5.0f\n"
+      "    };\n"
+      "    uint bx = ((uint)i.pos.x) & 3u;\n"
+      "    uint by = ((uint)i.pos.y) & 3u;\n"
+      "    float rot = kBayer16[by * 4u + bx] * (6.2831853f / 16.0f);\n"
+      "    float occ = 0.0f;\n"
+      "    [unroll]\n"
+      "    for (int k = 0; k < 12; ++k) {\n"
+      "        float ang = rot + (float)k * 2.3999632f;\n"
+      "        float r = sqrt(((float)k + 0.5f) / 12.0f);\n"
+      "        float2 suv = i.uv + float2(cos(ang), sin(ang)) * radUv * r;\n"
+      "        float sd = t0.SampleLevel(sPnt, suv, 0).r;\n"
+      "        if (sd >= 0.9998f || sd <= 0.0001f) continue;\n"
+      "        float3 Q = ReconstructViewPos(suv, sd);\n"
+      "        float3 v = Q - P;\n"
+      "        float dist = length(v);\n"
+      "        if (dist > 1e-5f) {\n"
+      "            float ndotv = dot(N, v / dist);\n"
+      "            float falloff = smoothstep(worldRad * 1.6f, worldRad * 0.15f, dist);\n"
+      "            occ += saturate(ndotv - 0.25f) * falloff;\n"
+      "        }\n"
+      "    }\n"
+      "    float ao = saturate(1.0f - (occ / 12.0f) * 1.55f);\n"
+      "    ao = lerp(0.45f, 1.0f, ao * ao);\n"
+      "    return float4(ao, ao, ao, 1.0f);\n"
+      "}\n"
+      "float4 PSBloomExtract(PostVSOut i) : SV_TARGET {\n"
+      "    float2 o = invRes.xy;\n"
+      "    float3 c = 0.25f * (\n"
+      "        t0.SampleLevel(sLin, i.uv + float2(-o.x, -o.y), 0).rgb +\n"
+      "        t0.SampleLevel(sLin, i.uv + float2( o.x, -o.y), 0).rgb +\n"
+      "        t0.SampleLevel(sLin, i.uv + float2(-o.x,  o.y), 0).rgb +\n"
+      "        t0.SampleLevel(sLin, i.uv + float2( o.x,  o.y), 0).rgb);\n"
+      "    c = min(c, float3(8.0f, 8.0f, 8.0f));\n"
+      "    float br = max(c.r, max(c.g, c.b));\n"
+      "    float thresh = blurDir.z;\n"
+      "    float knee = 0.35f;\n"
+      "    float soft = clamp(br - thresh + knee, 0.0f, 2.0f * knee);\n"
+      "    soft = (soft * soft) / (4.0f * knee + 1e-5f);\n"
+      "    float contrib = max(soft, br - thresh) / max(br, 1e-5f);\n"
+      "    return float4(c * saturate(contrib), 1.0f);\n"
+      "}\n"
+      "float4 PSBloomBlur(PostVSOut i) : SV_TARGET {\n"
+      "    static const float w[5] = { 0.2270270f, 0.1945946f, 0.1216216f, 0.0540541f, 0.0162162f };\n"
+      "    float3 acc = t0.SampleLevel(sLin, i.uv, 0).rgb * w[0];\n"
+      "    float2 stepUv = blurDir.xy;\n"
+      "    [unroll]\n"
+      "    for (int k = 1; k < 5; ++k) {\n"
+      "        acc += t0.SampleLevel(sLin, i.uv + stepUv * (float)k, 0).rgb * w[k];\n"
+      "        acc += t0.SampleLevel(sLin, i.uv - stepUv * (float)k, 0).rgb * w[k];\n"
+      "    }\n"
+      "    return float4(acc, 1.0f);\n"
+      "}\n"
+      "float3 SoftShoulderToneMap(float3 x) {\n"
+      "    float3 s = max(x - 0.85f, 0.0f);\n"
+      "    return min(x, 0.85f) + 0.15f * (s / (s + 0.55f));\n"
+      "}\n"
+      "float4 PSComposite(PostVSOut i) : SV_TARGET {\n"
+      "    float4 scene = t0.SampleLevel(sPnt, i.uv, 0);\n"
+      "    float3 col = scene.rgb;\n"
+      "    if (projExtra.z > 0.5f) {\n"
+      "        float cd = t3.SampleLevel(sPnt, i.uv, 0).r;\n"
+      "        if (cd < 0.9998f && cd > 0.0001f) {\n"
+      "            float cz = LinearViewZ(cd);\n"
+      "            float aoSum = 0.0f, wSum = 0.0f;\n"
+      "            [unroll]\n"
+      "            for (int dy = -1; dy <= 2; ++dy) {\n"
+      "                [unroll]\n"
+      "                for (int dx = -1; dx <= 2; ++dx) {\n"
+      "                    float2 suv = i.uv + float2(((float)dx - 0.5f) * invRes.z, ((float)dy - 0.5f) * invRes.w);\n"
+      "                    float sd = t3.SampleLevel(sPnt, suv, 0).r;\n"
+      "                    float sz = LinearViewZ(sd);\n"
+      "                    float dz = abs(sz - cz) / max(cz * 0.08f, 1e-4f);\n"
+      "                    float bw = exp(-dz * dz * 2.0f);\n"
+      "                    aoSum += t1.SampleLevel(sLin, suv, 0).r * bw;\n"
+      "                    wSum += bw;\n"
+      "                }\n"
+      "            }\n"
+      "            float ao = (wSum > 1e-4f) ? (aoSum / wSum) : 1.0f;\n"
+      "            col *= ao;\n"
+      "        }\n"
+      "    }\n"
+      "    if (projExtra.w > 0.5f) {\n"
+      "        float3 bloom = t2.SampleLevel(sLin, i.uv, 0).rgb;\n"
+      "        col += bloom * blurDir.w;\n"
+      "        col = SoftShoulderToneMap(max(col, 0.0f));\n"
+      "    }\n"
+      "    return float4(saturate(col), scene.a);\n"
+      "}\n";
+
+  auto compilePost = [&](const char *entry, const char *target, ID3DBlob **outBlob) -> bool {
+    ID3DBlob *eb = nullptr;
+    HRESULT hr = D3DCompile(kPostHlsl, std::strlen(kPostHlsl), "uwp_post.hlsl",
+                            nullptr, nullptr, entry, target, 0, 0, outBlob, &eb);
+    if (FAILED(hr)) {
+      if (eb) {
+        std::printf("[UWP-D3D11] Post shader %s err: %s\n", entry,
+                    static_cast<const char *>(eb->GetBufferPointer()));
+        eb->Release();
+      }
+      return false;
+    }
+    if (eb) eb->Release();
+    return true;
+  };
+  ID3DBlob *pBlob = nullptr;
+  if (compilePost("VSPost", "vs_4_0", &pBlob) && pBlob) {
+    g_dev->CreateVertexShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &g_vsPost);
+    pBlob->Release(); pBlob = nullptr;
+  }
+  if (compilePost("PSSsao", "ps_4_0", &pBlob) && pBlob) {
+    g_dev->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &g_psSsao);
+    pBlob->Release(); pBlob = nullptr;
+  }
+  if (compilePost("PSBloomExtract", "ps_4_0", &pBlob) && pBlob) {
+    g_dev->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &g_psBloomExtract);
+    pBlob->Release(); pBlob = nullptr;
+  }
+  if (compilePost("PSBloomBlur", "ps_4_0", &pBlob) && pBlob) {
+    g_dev->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &g_psBloomBlur);
+    pBlob->Release(); pBlob = nullptr;
+  }
+  if (compilePost("PSComposite", "ps_4_0", &pBlob) && pBlob) {
+    g_dev->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &g_psComposite);
+    pBlob->Release(); pBlob = nullptr;
+  }
+  {
+    D3D11_BUFFER_DESC pcbd{};
+    pcbd.ByteWidth = sizeof(CbPost);
+    pcbd.Usage = D3D11_USAGE_DYNAMIC;
+    pcbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    pcbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g_dev->CreateBuffer(&pcbd, nullptr, &g_cbPost);
+
+    D3D11_SAMPLER_DESC psd{};
+    psd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    psd.AddressU = psd.AddressV = psd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    psd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    psd.MaxLOD = D3D11_FLOAT32_MAX;
+    g_dev->CreateSamplerState(&psd, &g_sampLinearClamp);
+    psd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    g_dev->CreateSamplerState(&psd, &g_sampPointClamp);
+
+    // 3D attenuation light volumes must sample black outside [0,1]^3 (never WRAP into a grid!)
+    D3D11_SAMPLER_DESC vsd{};
+    vsd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    vsd.AddressU = vsd.AddressV = vsd.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+    vsd.BorderColor[0] = vsd.BorderColor[1] = vsd.BorderColor[2] = vsd.BorderColor[3] = 0.0f;
+    vsd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    vsd.MaxLOD = D3D11_FLOAT32_MAX;
+    g_dev->CreateSamplerState(&vsd, &g_sampVolBorder);
+  }
   return g_vs && g_ps && g_layout && g_cb;
 }
 
 static void ReleaseRenderTargets() {
-  if (g_ctx)
+  if (g_ctx) {
+    ID3D11ShaderResourceView *nullSrvs[4] = {};
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
-  if (g_rtv) {
-    g_rtv->Release();
-    g_rtv = nullptr;
   }
-  if (g_dsv) {
-    g_dsv->Release();
-    g_dsv = nullptr;
-  }
+  auto rel = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
+  rel(g_rtv);
+  rel(g_dsv);
+  rel(g_depthSrv);
+  rel(g_sceneSrv); rel(g_sceneRtv); rel(g_sceneTex);
+  rel(g_ssaoSrv);  rel(g_ssaoRtv);  rel(g_ssaoTex);
+  rel(g_bloomASrv); rel(g_bloomARtv); rel(g_bloomATex);
+  rel(g_bloomBSrv); rel(g_bloomBRtv); rel(g_bloomBTex);
+  g_boundToSceneRt = false;
 }
 
 static bool CreateRenderTargets(uint32_t w, uint32_t h) {
@@ -552,24 +836,60 @@ static bool CreateRenderTargets(uint32_t w, uint32_t h) {
   if (FAILED(hr))
     return false;
 
+  // Typeless 32-bit float depth buffer so we can bind both DSV (write) and SRV (high-precision SSAO depth read!)
   D3D11_TEXTURE2D_DESC dsDesc{};
   dsDesc.Width = w;
   dsDesc.Height = h;
   dsDesc.MipLevels = 1;
   dsDesc.ArraySize = 1;
-  dsDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+  dsDesc.Format = DXGI_FORMAT_R32_TYPELESS;
   dsDesc.SampleDesc.Count = 1;
-  dsDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+  dsDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
   ID3D11Texture2D *dsTex = nullptr;
   if (SUCCEEDED(g_dev->CreateTexture2D(&dsDesc, nullptr, &dsTex)) && dsTex) {
-    g_dev->CreateDepthStencilView(dsTex, nullptr, &g_dsv);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsvd{};
+    dsvd.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    g_dev->CreateDepthStencilView(dsTex, &dsvd, &g_dsv);
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format = DXGI_FORMAT_R32_FLOAT;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = 1;
+    g_dev->CreateShaderResourceView(dsTex, &srvd, &g_depthSrv);
     dsTex->Release();
   }
+
+  auto makeRt = [&](uint32_t tw, uint32_t th, DXGI_FORMAT fmt,
+                    ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
+                    ID3D11ShaderResourceView *&srv) {
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = std::max<uint32_t>(1u, tw);
+    td.Height = std::max<uint32_t>(1u, th);
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(g_dev->CreateTexture2D(&td, nullptr, &tex)) && tex) {
+      g_dev->CreateRenderTargetView(tex, nullptr, &rtv);
+      g_dev->CreateShaderResourceView(tex, nullptr, &srv);
+    }
+  };
+  g_ssaoW  = std::max<uint32_t>(1u, w / 2u);
+  g_ssaoH  = std::max<uint32_t>(1u, h / 2u);
+  g_bloomW = std::max<uint32_t>(1u, w / 4u);
+  g_bloomH = std::max<uint32_t>(1u, h / 4u);
+  makeRt(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, g_sceneTex, g_sceneRtv, g_sceneSrv);
+  makeRt(g_ssaoW, g_ssaoH, DXGI_FORMAT_R8_UNORM, g_ssaoTex, g_ssaoRtv, g_ssaoSrv);
+  makeRt(g_bloomW, g_bloomH, DXGI_FORMAT_R16G16B16A16_FLOAT, g_bloomATex, g_bloomARtv, g_bloomASrv);
+  makeRt(g_bloomW, g_bloomH, DXGI_FORMAT_R16G16B16A16_FLOAT, g_bloomBTex, g_bloomBRtv, g_bloomBSrv);
 
   D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h),
                     0.0f, 1.0f};
   g_ctx->RSSetViewports(1, &vp);
   g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+  g_boundToSceneRt = false;
   g_width = w;
   g_height = h;
   return true;
@@ -670,6 +990,9 @@ static std::atomic<bool> g_widescreenHorPlus{true};
 static std::atomic<bool> g_enhancedLighting{true};
 static std::atomic<float> g_charAmbientVal{0.48f};
 static std::atomic<bool> g_vsyncEnabled{true};
+static std::atomic<bool> g_ssaoEnabled{true};
+static std::atomic<bool> g_hdrBloomEnabled{true};
+static std::atomic<bool> g_charRimSpecEnabled{true};
 static float g_lastFps = 60.0f;
 
 void Resize(uint32_t width, uint32_t height) {
@@ -702,22 +1025,149 @@ bool GetWidescreenHorPlus() { return g_widescreenHorPlus.load(std::memory_order_
 void SetEnhancedLighting(bool enabled) { g_enhancedLighting.store(enabled, std::memory_order_relaxed); }
 void SetCharAmbient(float val) { g_charAmbientVal.store(val, std::memory_order_relaxed); }
 void SetVsyncEnabled(bool enabled) { g_vsyncEnabled.store(enabled, std::memory_order_relaxed); }
+void SetSsaoEnabled(bool enabled) { g_ssaoEnabled.store(enabled, std::memory_order_relaxed); }
+void SetHdrBloomEnabled(bool enabled) { g_hdrBloomEnabled.store(enabled, std::memory_order_relaxed); }
+void SetCharRimSpecEnabled(bool enabled) { g_charRimSpecEnabled.store(enabled, std::memory_order_relaxed); }
+
+static inline bool UsePostPipeline() {
+  return (g_ssaoEnabled.load(std::memory_order_relaxed) ||
+          g_hdrBloomEnabled.load(std::memory_order_relaxed)) &&
+         g_sceneRtv && g_sceneSrv && g_vsPost && g_psComposite && g_cbPost;
+}
+
+static void ResolvePostProcess() {
+  if (!g_ctx || !g_rtv || !g_sceneSrv || !g_vsPost || !g_psComposite || !g_cbPost) {
+    g_postResolved = true;
+    return;
+  }
+  bool doSsao  = g_ssaoEnabled.load(std::memory_order_relaxed) && g_ssaoRtv && g_ssaoSrv && g_depthSrv && g_psSsao;
+  bool doBloom = g_hdrBloomEnabled.load(std::memory_order_relaxed) && g_bloomARtv && g_bloomASrv && g_bloomBRtv && g_bloomBSrv && g_psBloomExtract && g_psBloomBlur;
+
+  ID3D11ShaderResourceView *nullSrvs[4] = {};
+  g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+  g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+
+  g_ctx->IASetInputLayout(nullptr);
+  g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  g_ctx->VSSetShader(g_vsPost, nullptr, 0);
+  g_ctx->PSSetConstantBuffers(0, 1, &g_cbPost);
+  ID3D11SamplerState *pSamps[2] = { g_sampLinearClamp, g_sampPointClamp };
+  g_ctx->PSSetSamplers(0, 2, pSamps);
+  g_ctx->RSSetState(g_rsCullNone);
+  g_ctx->OMSetDepthStencilState(g_dsOff, 0);
+  float bf[4] = {};
+  g_ctx->OMSetBlendState(g_blendOpaque, bf, 0xFFFFFFFFu);
+
+  auto writePostCb = [&](float dx, float dy, float thresh, float bloomInt) {
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (SUCCEEDED(g_ctx->Map(g_cbPost, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+      auto *cb = static_cast<CbPost *>(ms.pData);
+      cb->invRes[0] = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_width));
+      cb->invRes[1] = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_height));
+      cb->invRes[2] = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_ssaoW));
+      cb->invRes[3] = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_ssaoH));
+      cb->projParams[0] = g_last3DProj[0];
+      cb->projParams[1] = g_last3DProj[5];
+      cb->projParams[2] = g_last3DProj[10];
+      cb->projParams[3] = g_last3DProj[14];
+      cb->projExtra[0]  = g_last3DProj[11];
+      cb->projExtra[1]  = g_last3DProj[15];
+      cb->projExtra[2]  = doSsao ? 1.0f : 0.0f;
+      cb->projExtra[3]  = doBloom ? 1.0f : 0.0f;
+      cb->blurDir[0]    = dx;
+      cb->blurDir[1]    = dy;
+      cb->blurDir[2]    = thresh;
+      cb->blurDir[3]    = bloomInt;
+      g_ctx->Unmap(g_cbPost, 0);
+    }
+  };
+
+  // 1. Half-res SSAO pass from readable hardware depth buffer
+  if (doSsao) {
+    D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(g_ssaoW), static_cast<float>(g_ssaoH), 0.0f, 1.0f};
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->OMSetRenderTargets(1, &g_ssaoRtv, nullptr);
+    writePostCb(0.0f, 0.0f, 0.0f, 0.0f);
+    g_ctx->PSSetShader(g_psSsao, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, 1, &g_depthSrv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+  }
+
+  // 2. Quarter-res HDR Bloom extract + 2-pass separable Gaussian blur
+  if (doBloom) {
+    D3D11_VIEWPORT bvp{0.0f, 0.0f, static_cast<float>(g_bloomW), static_cast<float>(g_bloomH), 0.0f, 1.0f};
+    g_ctx->RSSetViewports(1, &bvp);
+    float invBw = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_bloomW));
+    float invBh = 1.0f / static_cast<float>(std::max<uint32_t>(1u, g_bloomH));
+
+    // Bright extract -> BloomA
+    g_ctx->OMSetRenderTargets(1, &g_bloomARtv, nullptr);
+    writePostCb(0.0f, 0.0f, 0.78f, 0.36f);
+    g_ctx->PSSetShader(g_psBloomExtract, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, 1, &g_sceneSrv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+
+    // Horizontal blur (BloomA -> BloomB)
+    g_ctx->OMSetRenderTargets(1, &g_bloomBRtv, nullptr);
+    writePostCb(invBw * 1.35f, 0.0f, 0.78f, 0.36f);
+    g_ctx->PSSetShader(g_psBloomBlur, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, 1, &g_bloomASrv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+
+    // Vertical blur (BloomB -> BloomA)
+    g_ctx->OMSetRenderTargets(1, &g_bloomARtv, nullptr);
+    writePostCb(0.0f, invBh * 1.35f, 0.78f, 0.36f);
+    g_ctx->PSSetShaderResources(0, 1, &g_bloomBSrv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+  }
+
+  // 3. Final composite (Scene * bilateral-blurred SSAO + HDR Bloom + Soft Shoulder Tone Map -> Backbuffer)
+  D3D11_VIEWPORT fullVp{0.0f, 0.0f, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f, 1.0f};
+  g_ctx->RSSetViewports(1, &fullVp);
+  g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+  writePostCb(0.0f, 0.0f, 0.78f, 0.36f);
+  g_ctx->PSSetShader(g_psComposite, nullptr, 0);
+  ID3D11ShaderResourceView *compSrvs[4] = {
+      g_sceneSrv,
+      doSsao ? g_ssaoSrv : nullptr,
+      doBloom ? g_bloomASrv : nullptr,
+      doSsao ? g_depthSrv : nullptr};
+  g_ctx->PSSetShaderResources(0, 4, compSrvs);
+  g_ctx->Draw(3, 0);
+  g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+
+  g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+  g_boundToSceneRt = false;
+  g_postResolved = true;
+  ResetPipelineCache();
+}
 
 void Clear(uint32_t xboxFlags, uint32_t argbColor, float depth) {
   if (!g_ctx || !g_rtv)
     return;
-  g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
-  if (xboxFlags & 0x000000F0u) { // Xbox D3DCLEAR_TARGET (RGBA mask 0xF0)
+  bool clearColor = (xboxFlags & 0x000000F0u) != 0u; // Xbox D3DCLEAR_TARGET (RGBA mask 0xF0)
+  if (clearColor) {
+    bool usePost = UsePostPipeline();
+    g_sceneHas3D = false;
+    g_postResolved = false;
+    ID3D11RenderTargetView *targetRtv = usePost ? g_sceneRtv : g_rtv;
+    g_ctx->OMSetRenderTargets(1, &targetRtv, g_dsv);
+    g_boundToSceneRt = usePost;
     float rgba[4] = {static_cast<float>((argbColor >> 16) & 0xFFu) / 255.0f,
                      static_cast<float>((argbColor >> 8) & 0xFFu) / 255.0f,
                      static_cast<float>(argbColor & 0xFFu) / 255.0f, 1.0f};
     g_ctx->ClearRenderTargetView(g_rtv, rgba);
+    if (usePost && g_sceneRtv)
+      g_ctx->ClearRenderTargetView(g_sceneRtv, rgba);
   }
   if (g_dsv &&
       (xboxFlags &
        0x00000003u)) { // Xbox D3DCLEAR_ZBUFFER (1) | D3DCLEAR_STENCIL (2)
-    g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
-                                 depth, 0);
+    g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH, depth, 0);
   }
 }
 
@@ -860,6 +1310,13 @@ void Present(bool vsync) {
       std::printf("[UWP-TRACE] Closed frame %u draw trace (%u draws)\n",
                   g_frameNum, g_drawNum);
     }
+    // Resolve 3D HDR + SSAO + Bloom to backbuffer if no 2D HUD draw triggered it yet
+    if (UsePostPipeline() && g_sceneHas3D && !g_postResolved) {
+      ResolvePostProcess();
+    } else if (g_boundToSceneRt && g_ctx && g_rtv) {
+      g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+      g_boundToSceneRt = false;
+    }
     // Draw in-game UWP / Xbox Dev Mode config menu & optional FPS badge before capture & present
     config_ui::RenderOverlay(g_lastFps, g_drawNum);
 
@@ -889,6 +1346,9 @@ void Present(bool vsync) {
       g_swapChain->Present(useVsync ? 1u : 0u, presentFlags);
     }
     ApplyPendingResizeIfNeeded();
+    g_sceneHas3D = false;
+    g_postResolved = false;
+    g_boundToSceneRt = false;
     ResetPipelineCache();
     // Only sleep during headless capture (where Present(0,0) doesn't VSync);
     // during interactive play, Present(1,0) handles VSync without double-stutter!
@@ -954,7 +1414,16 @@ void SetViewport(uint32_t x, uint32_t y, uint32_t w, uint32_t h, float minZ,
     return;
   float sx = static_cast<float>(g_width) / 640.0f;
   float sy = static_cast<float>(g_height) / 480.0f;
-  g_cur3DVp = D3D11_VIEWPORT{x * sx, y * sy, w * sx, h * sy, minZ, maxZ};
+  // Bottom-row 3D HUD weapon icon sub-viewports (active weapon + D-Pad weapon carousel)
+  // must use the exact same centered 4:3 coordinate space as the 2D Weapon Ring & frame.
+  bool isWeaponIconVp = (y >= 320u && w <= 160u && h <= 160u);
+  if (isWeaponIconVp && g_widescreenHorPlus.load(std::memory_order_relaxed) &&
+      g_height > 0u && g_width * 3u > g_height * 4u) {
+    float vpOffX = (static_cast<float>(g_width) - 640.0f * sy) * 0.5f;
+    g_cur3DVp = D3D11_VIEWPORT{vpOffX + x * sy, y * sy, w * sy, h * sy, minZ, maxZ};
+  } else {
+    g_cur3DVp = D3D11_VIEWPORT{x * sx, y * sy, w * sx, h * sy, minZ, maxZ};
+  }
   g_has3DVp = true;
   g_lastVpMode = 0;
   g_ctx->RSSetViewports(1, &g_cur3DVp);
@@ -1664,10 +2133,41 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
   if (!g_ctx || !g_vs || !g_ps || !g_vb || !g_rtv || drawCount == 0)
     return;
 
+  // Route 3D draws to offscreen HDR scene target and resolve SSAO + HDR Bloom cleanly before 2D HUD!
+  // Note: untextured fvf=0x044 rhw quads (e.g. mid-frame shadow-volume tint quads) draw before characters,
+  // so only trigger post-process resolve on textured 2D HUD/menu draws ((g_fvf & 0xF00u) != 0).
+  bool usePost = UsePostPipeline();
+  bool isTexturedHud = isRhw && ((g_fvf & 0xF00u) != 0u);
+  if (!isTexturedHud) {
+    if (usePost && !g_postResolved) {
+      if (!g_boundToSceneRt) {
+        g_ctx->OMSetRenderTargets(1, &g_sceneRtv, g_dsv);
+        g_boundToSceneRt = true;
+      }
+      if (!isRhw) {
+        g_sceneHas3D = true;
+        if (g_mProj[0] != 0.0f && g_mProj[5] != 0.0f) {
+          std::memcpy(g_last3DProj, g_mProj, 64);
+        }
+      }
+    } else if (g_boundToSceneRt) {
+      g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+      g_boundToSceneRt = false;
+    }
+  } else {
+    if (usePost && g_sceneHas3D && !g_postResolved) {
+      ResolvePostProcess();
+    } else if (g_boundToSceneRt) {
+      g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+      g_boundToSceneRt = false;
+    }
+  }
+
   // Bind static pipeline state ONCE per frame (reset in Present) instead of 1,700x/frame!
   if (!g_frameBound) {
     UINT stride = sizeof(UwpVert), offset = 0;
-    g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+    ID3D11RenderTargetView *activeRtv = g_boundToSceneRt ? g_sceneRtv : g_rtv;
+    g_ctx->OMSetRenderTargets(1, &activeRtv, g_dsv);
     g_ctx->IASetInputLayout(g_layout);
     g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &offset);
     if (g_ib)
@@ -1698,11 +2198,13 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
            srcBlend = 0x0302u, destBlend = 0x0303u, zWriteEn = 1u, zEnable = 1u,
            tf = 0xFFFFFFFFu;
   uint32_t cullMode = 0u, fogEnable = 0u, fogColorRaw = 0u;
-  uint32_t addrU0 = 1u, addrV0 = 1u, addrU1 = 1u, addrV1 = 1u;
+  uint32_t addrU0 = 1u, addrV0 = 1u, addrW0 = 3u, addrU1 = 1u, addrV1 = 1u, addrW1 = 3u;
+  uint32_t tci0 = 0u, tci1 = 0u;
   float fogStart = 0.0f, fogEnd = 1.0f;
   bool useTfRgb = false, useTfAlpha = false, texStage0Enabled = true,
        texStage1Enabled = false;
   float stage0Mul = 1.0f, stage1Op = 4.0f, charAmbient = 0.0f;
+  float rimStrength = 0.0f, specStrength = 0.0f;
   bool isWaterSurface = false;
   float alphaMode = 0.0f;
   uint32_t ttf0 = 0u, ttf1 = 0u;
@@ -1726,8 +2228,12 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
     fogColorRaw = rs[120];
     addrU0 = ts[0];
     addrV0 = ts[1];
+    addrW0 = ts[2];
     addrU1 = ts[32 + 0];
     addrV1 = ts[32 + 1];
+    addrW1 = ts[32 + 2];
+    tci0 = ts[28];
+    tci1 = ts[32 + 28];
     ttf0 = ts[21];
     ttf1 = ts[32 + 21];
     uint32_t cOp = ts[12];
@@ -1781,6 +2287,19 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
     bool isVolPass = (!isRhw && (g_boundTexVol[0] || g_boundTexVol[1]));
     if (!isVolPass && (isCharNonBumpOp25 || isOpaqueLitProp || (!isRhw && g_customVsHandle != 0u))) {
       charAmbient = g_charAmbientVal.load(std::memory_order_relaxed);
+    }
+    if (!isRhw && !isVolPass && !isWaterSurface && zWriteEn != 0u &&
+        g_charRimSpecEnabled.load(std::memory_order_relaxed)) {
+      if (isCharNonBumpOp25 || g_customVsHandle != 0u) {
+        rimStrength = 0.30f;
+        specStrength = 0.22f;
+      } else if (isRealBumpPass) {
+        rimStrength = 0.14f;
+        specStrength = 0.28f;
+      } else if (isOpaqueLitProp) {
+        rimStrength = 0.08f;
+        specStrength = 0.14f;
+      }
     }
     uint32_t cOp1 = ts[32 + 12];
     if (!isRhw && !isCharNonBumpOp25 && g_boundSrv[1] != nullptr &&
@@ -1863,7 +2382,12 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
     fillTexMat(cb->mTex0, g_mTex0, g_hasTexMat[0], ttf0, g_boundTexLin[0]);
     fillTexMat(cb->mTex1, g_mTex1, g_hasTexMat[1], ttf1, g_boundTexLin[1]);
     cb->alphaParams[0] = alphaMode;
-    cb->alphaParams[1] = cb->alphaParams[2] = cb->alphaParams[3] = 0.0f;
+    cb->alphaParams[1] = rimStrength;
+    cb->alphaParams[2] = specStrength;
+    uint32_t tciFlags = 0u;
+    if (!isRhw && (tci0 & 0xFFFF0000u) == 0x00020000u) tciFlags |= 1u;
+    if (!isRhw && (tci1 & 0xFFFF0000u) == 0x00020000u) tciFlags |= 2u;
+    cb->alphaParams[3] = static_cast<float>(tciFlags);
     g_ctx->Unmap(g_cb, 0);
   }
 
@@ -1871,8 +2395,9 @@ static void SubmitDraw(D3D11_PRIMITIVE_TOPOLOGY topo, bool isRhw, bool indexed,
     g_ctx->IASetPrimitiveTopology(topo);
     g_lastTopo = topo;
   }
-  ID3D11SamplerState *samps[2] = {GetXboxSampler(addrU0, addrV0),
-                                  GetXboxSampler(addrU1, addrV1)};
+  ID3D11SamplerState *samps[2] = {
+      GetXboxSampler(addrU0, addrV0, addrW0, g_boundTexVol[0]),
+      GetXboxSampler(addrU1, addrV1, addrW1, g_boundTexVol[1])};
   if (samps[0] != g_lastSamps[0] || samps[1] != g_lastSamps[1]) {
     g_ctx->PSSetSamplers(0, 2, samps);
     g_lastSamps[0] = samps[0];
@@ -2315,6 +2840,15 @@ void ResetForRelaunch() {
   std::memcpy(g_mTex0,  kIdent, 64);
   std::memcpy(g_mTex1,  kIdent, 64);
   g_hasTexMat[0] = g_hasTexMat[1] = false;
+  g_sceneHas3D = false;
+  g_postResolved = false;
+  g_boundToSceneRt = false;
+  std::memcpy(g_last3DProj, kIdent, 64);
+  if (g_ctx) {
+    ID3D11ShaderResourceView *nullSrvs[4] = {};
+    g_ctx->PSSetShaderResources(0, 4, nullSrvs);
+    if (g_rtv) g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+  }
   ResetPipelineCache();
 }
 
@@ -2404,6 +2938,16 @@ void Shutdown() {
     g_vs->Release();
     g_vs = nullptr;
   }
+  auto relPost = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
+  relPost(g_vsPost);
+  relPost(g_psSsao);
+  relPost(g_psBloomExtract);
+  relPost(g_psBloomBlur);
+  relPost(g_psComposite);
+  relPost(g_cbPost);
+  relPost(g_sampLinearClamp);
+  relPost(g_sampPointClamp);
+  relPost(g_sampVolBorder);
   ReleaseRenderTargets();
   if (g_swapChain) {
     g_swapChain->Release();

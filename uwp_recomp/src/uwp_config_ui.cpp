@@ -36,7 +36,7 @@ static constexpr ResOpt kResOpts[] = {
     { 5120, 2160, "5120 x 2160 (21:9 5K2K)"  },
 };
 static constexpr int kNumResOpts = 9;
-static constexpr int kNumMenuItems = 8;
+static constexpr int kNumMenuItems = 11;
 
 static int FindResIndex(uint32_t w, uint32_t h) {
     for (int i = 0; i < kNumResOpts; ++i) {
@@ -51,6 +51,9 @@ static void SyncBridgeSettings() {
     static const float kAmbVals[3] = { 0.25f, 0.48f, 0.65f };
     int idx = (g_cfg.ambientLevel < 0) ? 0 : (g_cfg.ambientLevel > 2 ? 2 : g_cfg.ambientLevel);
     d3d11_bridge::SetCharAmbient(kAmbVals[idx]);
+    d3d11_bridge::SetSsaoEnabled(g_cfg.ssao);
+    d3d11_bridge::SetHdrBloomEnabled(g_cfg.hdrBloom);
+    d3d11_bridge::SetCharRimSpecEnabled(g_cfg.charRimSpec);
     d3d11_bridge::SetVsyncEnabled(g_cfg.vsync);
 }
 
@@ -78,6 +81,9 @@ void Load(const char* configPath) {
             else if (std::sscanf(line, "Widescreen=%u", &v) == 1) g_cfg.widescreenHorPlus = (v != 0);
             else if (std::sscanf(line, "EnhancedLighting=%u", &v) == 1) g_cfg.enhancedLighting = (v != 0);
             else if (std::sscanf(line, "AmbientLevel=%u", &v) == 1 && v <= 2) g_cfg.ambientLevel = static_cast<int>(v);
+            else if (std::sscanf(line, "SSAO=%u", &v) == 1) g_cfg.ssao = (v != 0);
+            else if (std::sscanf(line, "HDRBloom=%u", &v) == 1) g_cfg.hdrBloom = (v != 0);
+            else if (std::sscanf(line, "CharRimSpec=%u", &v) == 1) g_cfg.charRimSpec = (v != 0);
             else if (std::sscanf(line, "VSync=%u", &v) == 1) g_cfg.vsync = (v != 0);
             else if (std::sscanf(line, "ShowFPS=%u", &v) == 1) g_cfg.showFps = (v != 0);
         }
@@ -93,10 +99,12 @@ void Save() {
     if (FILE* f = std::fopen(g_cfgPath.c_str(), "w")) {
         std::fprintf(f,
             "Width=%u\nHeight=%u\nFullscreen=%u\nWidescreen=%u\n"
-            "EnhancedLighting=%u\nAmbientLevel=%d\nVSync=%u\nShowFPS=%u\n",
+            "EnhancedLighting=%u\nAmbientLevel=%d\nSSAO=%u\nHDRBloom=%u\nCharRimSpec=%u\n"
+            "VSync=%u\nShowFPS=%u\n",
             g_cfg.width, g_cfg.height, g_cfg.fullscreen ? 1u : 0u,
             g_cfg.widescreenHorPlus ? 1u : 0u, g_cfg.enhancedLighting ? 1u : 0u,
-            g_cfg.ambientLevel, g_cfg.vsync ? 1u : 0u, g_cfg.showFps ? 1u : 0u);
+            g_cfg.ambientLevel, g_cfg.ssao ? 1u : 0u, g_cfg.hdrBloom ? 1u : 0u,
+            g_cfg.charRimSpec ? 1u : 0u, g_cfg.vsync ? 1u : 0u, g_cfg.showFps ? 1u : 0u);
         std::fclose(f);
     }
 }
@@ -131,13 +139,22 @@ static void ApplyItemDelta(int item, int dir) {
         case 4: // Character Ambient
             g_cfg.ambientLevel = (g_cfg.ambientLevel + dir + 3) % 3;
             break;
-        case 5: // VSync
+        case 5: // SSAO
+            g_cfg.ssao = !g_cfg.ssao;
+            break;
+        case 6: // HDR Bloom
+            g_cfg.hdrBloom = !g_cfg.hdrBloom;
+            break;
+        case 7: // Character Rim & Specular
+            g_cfg.charRimSpec = !g_cfg.charRimSpec;
+            break;
+        case 8: // VSync
             g_cfg.vsync = !g_cfg.vsync;
             break;
-        case 6: // Show FPS
+        case 9: // Show FPS
             g_cfg.showFps = !g_cfg.showFps;
             break;
-        case 7: // Save & Close
+        case 10: // Save & Close
             Save();
             g_open = false;
             break;
@@ -203,7 +220,7 @@ void RenderOverlay(float fps, uint32_t drawCalls) {
     d3d11_bridge::DrawOverlayRect(0.0f, 0.0f, 640.0f, 480.0f, 0x8806030Au);
 
     // Main gothic config panel (centered in 640x480 virtual canvas)
-    const float px = 110.0f, py = 56.0f, pw = 420.0f, ph = 360.0f;
+    const float px = 110.0f, py = 36.0f, pw = 420.0f, ph = 406.0f;
     d3d11_bridge::DrawOverlayRect(px - 2.0f, py - 2.0f, pw + 4.0f, ph + 4.0f, 0xFF8E24AAu); // Violet outer border
     d3d11_bridge::DrawOverlayRect(px, py, pw, ph, 0xEA12081Cu);                              // Deep gothic midnight bg
     d3d11_bridge::DrawOverlayRect(px, py, pw, 38.0f, 0xFF3A0F4Au);                           // Header bar
@@ -237,6 +254,9 @@ void RenderOverlay(float fps, uint32_t drawCalls) {
         "Widescreen (Hor+ FOV)",
         "Enhanced Dynamic Lighting",
         "Character Ambient",
+        "SSAO Ambient Occlusion",
+        "HDR Bloom & Tone Map",
+        "Character Rim & Specular",
         "VSync",
         "Show FPS Counter",
         "Save & Close Menu",
@@ -247,13 +267,16 @@ void RenderOverlay(float fps, uint32_t drawCalls) {
         g_cfg.widescreenHorPlus ? "ON (HOR+)"  : "OFF (4:3)",
         g_cfg.enhancedLighting  ? "ON"         : "OFF",
         ambNames[ambIdx],
+        g_cfg.ssao              ? "ON"         : "OFF",
+        g_cfg.hdrBloom          ? "ON"         : "OFF",
+        g_cfg.charRimSpec       ? "ON"         : "OFF",
         g_cfg.vsync             ? "ON (VSYNC)" : "OFF (UNCAPPED)",
         g_cfg.showFps           ? "ON"         : "OFF",
         "[ A / ENTER ]",
     };
 
-    float rowY = py + 52.0f;
-    const float rowH = 30.0f;
+    float rowY = py + 48.0f;
+    const float rowH = 27.0f;
     for (int i = 0; i < kNumMenuItems; ++i) {
         bool sel = (i == g_sel);
         if (sel) {
@@ -264,8 +287,8 @@ void RenderOverlay(float fps, uint32_t drawCalls) {
         }
         uint32_t lblCol = sel ? 0xFFFFFFFFu : 0xFFD1C4E9u;
         uint32_t valCol = sel ? 0xFFFFD54Fu : 0xFFB39DDBu;
-        d3d11_bridge::DrawOverlayText(px + 22.0f, rowY + 8.0f, 1.0f, lblCol, labels[i]);
-        d3d11_bridge::DrawOverlayText(px + 235.0f, rowY + 8.0f, 1.0f, valCol, values[i]);
+        d3d11_bridge::DrawOverlayText(px + 22.0f, rowY + 6.5f, 1.0f, lblCol, labels[i]);
+        d3d11_bridge::DrawOverlayText(px + 235.0f, rowY + 6.5f, 1.0f, valCol, values[i]);
         rowY += rowH;
     }
 

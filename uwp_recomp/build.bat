@@ -20,7 +20,9 @@ if not defined VSDIR (
     echo Install Visual Studio 2022/2026 Build Tools with "Desktop development with C++".
     exit /b 1
 )
+set "VSCMD_START_DIR=%CD%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
+cd /d "%~dp0\.."
 
 :: 2. Lift Default.xbe -> uwp_recomp\src\generated\ if not yet generated
 if not exist "uwp_recomp\src\generated\recomp_register.cpp" (

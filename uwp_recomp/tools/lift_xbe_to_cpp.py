@@ -431,6 +431,15 @@ class X86Lifter:
                 b = self.read_op(insn, ops[0], 32)
                 return f"{{ int64_t p = static_cast<int64_t>(static_cast<int32_t>(ctx.eax)) * static_cast<int32_t>({b}); ctx.eax = static_cast<uint32_t>(p); ctx.edx = static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32); }}"
 
+        if m == "mul" and len(ops) == 1:
+            bits = ops[0].size * 8 or 32
+            b = self.read_op(insn, ops[0], bits)
+            if bits == 8:
+                return f"{{ uint16_t p = static_cast<uint16_t>(X86Context::lo8(ctx.eax)) * static_cast<uint16_t>({b}); X86Context::setLo16(ctx.eax, p); ctx.cf = ctx.of = ((p >> 8) != 0u); }}"
+            if bits == 16:
+                return f"{{ uint32_t p = static_cast<uint32_t>(X86Context::lo16(ctx.eax)) * static_cast<uint32_t>({b}); X86Context::setLo16(ctx.eax, static_cast<uint16_t>(p)); X86Context::setLo16(ctx.edx, static_cast<uint16_t>(p >> 16)); ctx.cf = ctx.of = ((p >> 16) != 0u); }}"
+            return f"{{ uint64_t p = static_cast<uint64_t>(ctx.eax) * static_cast<uint32_t>({b}); ctx.eax = static_cast<uint32_t>(p); ctx.edx = static_cast<uint32_t>(p >> 32); ctx.cf = ctx.of = (ctx.edx != 0u); }}"
+
         if m == "idiv" and len(ops) == 1:
             d = self.read_op(insn, ops[0], 32)
             return f"{{ int64_t num = (static_cast<int64_t>(static_cast<int32_t>(ctx.edx)) << 32) | ctx.eax; int32_t den = static_cast<int32_t>({d}); if (den) {{ ctx.eax = static_cast<uint32_t>(num / den); ctx.edx = static_cast<uint32_t>(num % den); }} }}"
